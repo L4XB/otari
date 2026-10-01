@@ -24,7 +24,7 @@ export function SettingsGroup({
   action,
   description,
   docsHref,
-  bounded = false,
+  isBounded = false,
   children,
 }: {
   /**
@@ -52,7 +52,7 @@ export function SettingsGroup({
   /** Trails the description, for the page of the manual this group is about. */
   docsHref?: string
   /** Frame the rows instead of bleeding them. See the note above. */
-  bounded?: boolean
+  isBounded?: boolean
   children: ReactNode
 }) {
   const heading =
@@ -91,14 +91,14 @@ export function SettingsGroup({
       </div>
     )
 
-  if (bounded) {
+  if (isBounded) {
     return (
       <section className="flex flex-col gap-3">
         {headingRow}
-        {/* `otari-settings` is the dense place, the way `otari-toolbar` is:
-            globals.css sizes `.input` and `.select__trigger` inside it, so a
-            row's control is 32px beside its label on a desk and 44px at 16px
-            where it stacks full width on a phone. A row never picks a height. */}
+        {/* `otari-settings` declares `--field-height` and `--field-padding-block`
+            for `.input` and `.select__trigger`: 32px beside the label on a
+            desktop, 44px where the control stacks full width on a phone.
+            A subtree needing the form size resets both variables. */}
         <div className="otari-settings flex flex-col divide-y divide-border-subtle border border-border">
           {children}
         </div>

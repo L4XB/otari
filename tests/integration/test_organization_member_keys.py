@@ -26,11 +26,12 @@ from fastapi import status
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
-from gateway.auth.models import generate_api_key, hash_key, key_prefix
+from gateway.adapters.api_key_format_adapter import DefaultApiKeyFormatAdapter
+from gateway.auth.models import hash_key
 from gateway.core.config import API_ROOT
-from gateway.models.entities import APIKey, DashboardSession
-from gateway.models.entities import User as BillingUser
-from gateway.models.tenancy import Organization, OrganizationMember, User, Workspace, WorkspaceMember
+from gateway.models.api_keys import APIKey
+from gateway.models.tenancy import DashboardSession, Organization, OrganizationMember, User, Workspace, WorkspaceMember
+from gateway.models.users import User as BillingUser
 from gateway.services.dashboard_session_service import SESSION_COOKIE_NAME, hash_session_token
 
 _PREFIX = f"{API_ROOT}/organizations/me/keys"
@@ -55,12 +56,14 @@ def _identity(
     role: str = "member",
     workspace_ids: tuple[uuid.UUID, ...] = (),
     membership: bool = True,
+    is_superuser: bool = False,
 ) -> tuple[uuid.UUID, str]:
     """Create an identity with a live dashboard session, and return its cookie."""
     user = User(
         email=email,
         full_name=email.split("@")[0].title(),
         active_organization_id=organization_id,
+        is_superuser=is_superuser,
     )
     session.add(user)
     session.commit()
@@ -150,6 +153,17 @@ def world(client: TestClient, master_key_header: dict[str, str], db_session_fact
             # In the organization, in none of its workspaces.
             "alpha_newcomer": _identity(session, email="new@alpha.test", organization_id=alpha.id),
             "beta_owner": _identity(session, email="owner@beta.test", organization_id=beta.id, role="owner"),
+            # The deployment operator, acting inside alpha. `/api/v1/users` is
+            # organization-scoped, and a header master key resolves the bootstrap
+            # operator and so acts in the *default* organization, which alpha is
+            # not; revoking alpha's identity is therefore this session's to do.
+            "alpha_operator": _identity(
+                session,
+                email="operator@alpha.test",
+                organization_id=alpha.id,
+                role="owner",
+                is_superuser=True,
+            ),
             # Points at alpha, belongs to nothing: the stale-pointer shape.
             "impostor": _identity(
                 session,
@@ -219,9 +233,7 @@ def test_a_member_creates_a_key_in_a_workspace_they_belong_to(client: TestClient
     assert row["workspace_id"] == str(world.workspaces["alpha_one"])
 
 
-def test_a_member_cannot_mint_into_a_sibling_workspace_they_do_not_belong_to(
-    client: TestClient, world: _World
-) -> None:
+def test_a_member_cannot_mint_into_a_sibling_workspace_they_do_not_belong_to(client: TestClient, world: _World) -> None:
     """Alpha two is their organization's, so scoping to the organization alone would pass everything but this."""
     code, body = _create(
         client,
@@ -254,9 +266,7 @@ def test_an_owner_may_mint_into_any_workspace_of_their_organization(client: Test
     assert body["user_id"] == str(world.users["alpha_owner"])
 
 
-def test_an_omitted_workspace_means_the_default_one_the_caller_belongs_to(
-    client: TestClient, world: _World
-) -> None:
+def test_an_omitted_workspace_means_the_default_one_the_caller_belongs_to(client: TestClient, world: _World) -> None:
     code, body = _create(client, world, "alpha_member", {"key_name": "defaulted"})
     assert code == status.HTTP_200_OK, body
 
@@ -273,9 +283,7 @@ def test_an_omitted_workspace_refuses_a_caller_outside_the_default_one(client: T
     assert "workspace" in body["detail"]
 
 
-def test_a_revoked_spend_identity_cannot_mint_its_way_back(
-    client: TestClient, world: _World, master_key_header: dict[str, str]
-) -> None:
+def test_a_revoked_spend_identity_cannot_mint_its_way_back(client: TestClient, world: _World) -> None:
     """``DELETE /api/v1/users`` is the operator's revocation, and this surface must not undo it.
 
     That route soft-deletes the spend identity and deactivates every key it
@@ -289,20 +297,27 @@ def test_a_revoked_spend_identity_cannot_mint_its_way_back(
     code, first = _create(client, world, "alpha_member", {"key_name": "before", "workspace_id": workspace})
     assert code == status.HTTP_200_OK, first
 
-    revoke = client.delete(f"{API_ROOT}/users/{owner_id}", headers=master_key_header)
-    assert revoke.status_code == status.HTTP_204_NO_CONTENT, revoke.text
+    revoke_code, revoked = _request(client, world, "alpha_operator", "DELETE", f"{API_ROOT}/users/{owner_id}")
+    assert revoke_code == status.HTTP_204_NO_CONTENT, revoked
 
     code, body = _create(client, world, "alpha_member", {"key_name": "after", "workspace_id": workspace})
     assert code == status.HTTP_409_CONFLICT, body
 
     # The revocation still stands afterwards, which is what the operator surface
-    # refusing the same owner reports.
-    response = client.post(
+    # refusing the same owner reports. Asked as the operator inside alpha, and
+    # the detail is asserted, because that router is organization-scoped now: a
+    # master key would answer the same 404 for being in the wrong organization,
+    # which would pass this without saying anything about the revocation.
+    code, body = _request(
+        client,
+        world,
+        "alpha_operator",
+        "POST",
         f"{API_ROOT}/keys",
-        headers=master_key_header,
         json={"key_name": "operator", "user_id": owner_id, "workspace_id": workspace},
     )
-    assert response.status_code == status.HTTP_404_NOT_FOUND, response.text
+    assert code == status.HTTP_404_NOT_FOUND, body
+    assert "has been deleted" in body["detail"]
 
 
 def test_a_stale_organization_pointer_grants_nothing(client: TestClient, world: _World) -> None:
@@ -398,7 +413,7 @@ def test_a_key_the_member_owns_but_did_not_mint_is_theirs_to_manage(
     owner predicate on its own, and that it carries the whole lifecycle rather
     than the list alone.
     """
-    raw = generate_api_key()
+    raw = DefaultApiKeyFormatAdapter(None).mint()
     key_id = str(uuid.uuid4())
     owner_id = str(world.users["alpha_member"])
     session = db_session_factory()
@@ -412,7 +427,7 @@ def test_a_key_the_member_owns_but_did_not_mint_is_theirs_to_manage(
                 id=key_id,
                 workspace_id=world.workspaces["alpha_one"],
                 key_hash=hash_key(raw),
-                key_prefix=key_prefix(raw),
+                key_prefix=DefaultApiKeyFormatAdapter(None).fingerprint(raw),
                 key_name="handed-over",
                 user_id=owner_id,
             )
@@ -468,6 +483,8 @@ def test_the_workspace_filter_narrows_and_never_widens(client: TestClient, world
 def test_a_member_updates_rotates_and_revokes_their_own_key(client: TestClient, world: _World) -> None:
     code, created = _create(client, world, "alpha_member", {"key_name": "lifecycle"})
     assert code == status.HTTP_200_OK
+    assert created["key_prefix"] == created["key"][:10]
+    assert created["key_suffix"] == created["key"][-4:]
 
     code, updated = _request(
         client, world, "alpha_member", "PATCH", f"{_PREFIX}/{created['id']}", json={"key_name": "renamed"}
@@ -479,6 +496,10 @@ def test_a_member_updates_rotates_and_revokes_their_own_key(client: TestClient, 
     assert code == status.HTTP_200_OK, rotated
     assert rotated["id"] == created["id"]
     assert rotated["key"] != created["key"]
+    # The member-facing rotate re-fingerprints too, the same guard the operator's
+    # rotate carries: the displayed halves must name the secret that now works.
+    assert rotated["key_prefix"] == rotated["key"][:10]
+    assert rotated["key_suffix"] == rotated["key"][-4:]
 
     code, _ = _request(client, world, "alpha_member", "DELETE", f"{_PREFIX}/{created['id']}")
     assert code == status.HTTP_204_NO_CONTENT

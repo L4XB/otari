@@ -8,13 +8,13 @@ from typing import NamedTuple
 
 from genai_prices import Usage, calc_price
 from genai_prices.types import PriceCalculation, TieredPrices
-from sqlalchemy import case, or_, select
+from sqlalchemy import case, distinct, func, or_, select, true
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from gateway.core.config import API_ROOT
 from gateway.core.metered_pricing import meter_cost, quantize_cost, to_decimal
 from gateway.log_config import logger
-from gateway.models.entities import ModelPricing, OrganizationModelPricing
+from gateway.models.pricing import ModelPricing, OrganizationModelPricing, PriceSource
 
 # A zero-token usage is enough to resolve a model's per-million rates from
 # genai-prices without depending on real token counts.
@@ -301,6 +301,21 @@ def model_context_window(provider: str | None, model: str, as_of: datetime | Non
     return calc.model.context_window
 
 
+def default_pricing_reference(provider: str | None, model: str, as_of: datetime | None = None) -> str | None:
+    """Which genai-prices entry :func:`default_model_pricing` would price a model from.
+
+    ``provider_id:model_id`` in the dataset's own spelling, or ``None`` on a miss.
+    The resolution walks five fallbacks, so the entry that answers is often not
+    the one the selector named (a Bedrock id priced under ``anthropic``, a bare
+    name matched provider-agnostically); saying which one is what lets a reader
+    judge whether the default is the right rate rather than a plausible one.
+    """
+    calc = _resolve_genai_price(provider, model, normalize_effective_at(as_of))
+    if calc is None:
+        return None
+    return f"{calc.provider.id}:{calc.model.id}"
+
+
 def default_model_pricing(provider: str | None, model: str, as_of: datetime) -> ModelPricing | None:
     """Resolve community-maintained default pricing for a model via genai-prices.
 
@@ -350,7 +365,7 @@ def default_model_pricing(provider: str | None, model: str, as_of: datetime) -> 
     )
 
 
-def _override_as_model_pricing(override: OrganizationModelPricing) -> ModelPricing:
+def override_as_model_pricing(override: OrganizationModelPricing) -> ModelPricing:
     """Present an organization's override as a transient ``ModelPricing``.
 
     The same trick :func:`default_model_pricing` uses for a genai-prices match,
@@ -377,6 +392,7 @@ def _override_as_model_pricing(override: OrganizationModelPricing) -> ModelPrici
         cache_write_price_per_million=override.cache_write_price_per_million,
         cache_write_1h_price_per_million=override.cache_write_1h_price_per_million,
         pricing_tiers=override.pricing_tiers or [],
+        unit=override.unit or "tokens",
     )
 
 
@@ -429,7 +445,7 @@ async def _find_organization_override(
         .limit(1)
     )
     override = (await db.execute(stmt)).scalar_one_or_none()
-    return _override_as_model_pricing(override) if override is not None else None
+    return override_as_model_pricing(override) if override is not None else None
 
 
 class OverridePeriod(NamedTuple):
@@ -477,7 +493,7 @@ async def load_organization_override_index(
             effective_to = normalize_effective_at(row.effective_to) if row.effective_to is not None else None
             index.setdefault(row.model_key, []).append(
                 OverridePeriod(
-                    normalize_effective_at(row.effective_from), effective_to, _override_as_model_pricing(row)
+                    normalize_effective_at(row.effective_from), effective_to, override_as_model_pricing(row)
                 )
             )
     for periods in index.values():
@@ -517,6 +533,18 @@ def resolve_organization_override(
     return None
 
 
+def pricing_key_forms(model_key: str) -> list[str]:
+    """The stored key forms a lookup offers for a selector, canonical first.
+
+    A row written before keys were canonicalized may still spell the legacy
+    ``provider/model``. Settlement, an organization override and the catalog all
+    offer the same forms in the same order, so a rate one of them finds cannot be
+    a rate another misses.
+    """
+    instance, separator, model = model_key.partition(":")
+    return [model_key, f"{instance}/{model}"] if separator else [model_key]
+
+
 async def _find_by_model_key(db: AsyncSession, model_key: str, as_of: datetime) -> ModelPricing | None:
     stmt = (
         select(ModelPricing)
@@ -529,6 +557,143 @@ async def _find_by_model_key(db: AsyncSession, model_key: str, as_of: datetime) 
     )
     result = await db.execute(stmt)
     return result.scalar_one_or_none()
+
+
+def _canonical_key_form(model_key: str) -> str:
+    """The ``provider:model`` spelling of a key stored in the legacy form."""
+    instance, separator, model = model_key.partition("/")
+    return f"{instance}:{model}" if separator and ":" not in model_key else model_key
+
+
+async def rates_in_force(
+    db: AsyncSession,
+    *,
+    as_of: datetime | None = None,
+    limit: int,
+    exclude_key_prefix: str | None = None,
+) -> list[ModelPricing]:
+    """Each priced model's stored rate in force at ``as_of``, newest key first.
+
+    The bulk form of what :func:`find_model_pricing` resolves for one model, and
+    it has to agree with it: a model stored under both the canonical
+    ``provider:model`` key and the legacy ``provider/model`` one is reported
+    once, under the key a lookup would return, so a report cannot name a row
+    settlement would never pick.
+    """
+    lookup_time = normalize_effective_at(as_of)
+    latest_effective = (
+        select(ModelPricing.model_key.label("model_key"), func.max(ModelPricing.effective_at).label("effective_at"))
+        .where(ModelPricing.effective_at <= lookup_time)
+        .group_by(ModelPricing.model_key)
+        .subquery()
+    )
+    stmt = select(ModelPricing).join(
+        latest_effective,
+        (ModelPricing.model_key == latest_effective.c.model_key)
+        & (ModelPricing.effective_at == latest_effective.c.effective_at),
+    )
+    if exclude_key_prefix is not None:
+        stmt = stmt.where(ModelPricing.model_key.notlike(f"{exclude_key_prefix}%"))
+    # One more than asked for is never returned; the caller's bound is the wire
+    # bound. Ordered by key so the page is stable between reads.
+    rows = list((await db.execute(stmt.order_by(ModelPricing.model_key))).scalars())
+    stored = {row.model_key for row in rows}
+    in_force = [row for row in rows if _canonical_key_form(row.model_key) not in stored - {row.model_key}]
+    return in_force[:limit]
+
+
+async def _keys_shadowed_by_their_canonical_form(db: AsyncSession) -> set[str]:
+    """Legacy ``provider/model`` keys that also exist as ``provider:model``.
+
+    A lookup resolves such a model to the canonical row, so the legacy one is a
+    rate nothing is ever metered at and listing it would report one model twice.
+    :func:`rates_in_force` drops it after reading everything, which a paged read
+    cannot do: dropping rows after the window makes a short page and a count
+    that disagrees with it. So the keys are resolved first and excluded in SQL.
+
+    Two statements rather than string surgery in the query: splitting on the
+    *first* separator is what :func:`_canonical_key_form` means, and neither
+    ``replace`` (which takes every occurrence) nor a portable ``position`` says
+    that across both PostgreSQL and SQLite. A write normalizes its key
+    (``normalize_pricing_key``), so the legacy form only survives in older rows
+    and the first statement usually answers empty.
+    """
+
+    legacy = set(
+        (
+            await db.scalars(
+                select(distinct(ModelPricing.model_key)).where(
+                    ModelPricing.model_key.like("%/%"),
+                    ModelPricing.model_key.notlike("%:%"),
+                )
+            )
+        ).all()
+    )
+    if not legacy:
+        return set()
+    canonical = {key: _canonical_key_form(key) for key in legacy}
+    wanted = sorted(set(canonical.values()))
+    present: set[str] = set()
+    for start in range(0, len(wanted), _KEY_CHUNK):
+        chunk = wanted[start : start + _KEY_CHUNK]
+        present.update(
+            (await db.scalars(select(distinct(ModelPricing.model_key)).where(ModelPricing.model_key.in_(chunk)))).all()
+        )
+    return {key for key, form in canonical.items() if form in present}
+
+
+async def current_rates_page(
+    db: AsyncSession,
+    *,
+    skip: int,
+    limit: int,
+    as_of: datetime | None = None,
+) -> tuple[list[ModelPricing], int]:
+    """One page of each priced model's current rate, with the total model count.
+
+    :func:`rates_in_force` answers what settlement would pick, so a key whose
+    only row is scheduled for later has none. The catalog needs the wider view:
+    a rate an operator has queued is one the table has to show, so this falls
+    back to the earliest scheduled row where nothing has taken effect yet. The
+    two agree wherever a rate is live.
+    """
+
+    lookup_time = normalize_effective_at(as_of)
+    shadowed = await _keys_shadowed_by_their_canonical_form(db)
+    # One grouped pass rather than a join of a past and a future subquery: the
+    # group-wide MIN is the earliest row, and COALESCE only reaches it when no
+    # row has taken effect. A FULL OUTER JOIN would say the same thing and is
+    # not portable to the SQLite the OSS edition runs on.
+    chosen = (
+        select(
+            ModelPricing.model_key.label("model_key"),
+            func.coalesce(
+                func.max(case((ModelPricing.effective_at <= lookup_time, ModelPricing.effective_at))),
+                func.min(ModelPricing.effective_at),
+            ).label("effective_at"),
+        )
+        .where(ModelPricing.model_key.notin_(shadowed) if shadowed else true())
+        .group_by(ModelPricing.model_key)
+        .subquery()
+    )
+    # ``(model_key, effective_at)`` is the primary key, so the join keeps one row
+    # per model. Ordered by key so a page is stable between reads.
+    stmt = (
+        select(ModelPricing)
+        .join(
+            chosen,
+            (ModelPricing.model_key == chosen.c.model_key) & (ModelPricing.effective_at == chosen.c.effective_at),
+        )
+        .order_by(ModelPricing.model_key)
+        .offset(skip)
+        .limit(limit)
+    )
+    rows = list((await db.execute(stmt)).scalars())
+    total = select(func.count(distinct(ModelPricing.model_key)))
+    if shadowed:
+        total = total.where(ModelPricing.model_key.notin_(shadowed))
+    count = await db.scalar(total)
+    return rows, count or 0
 
 
 async def find_model_pricing(
@@ -570,14 +735,43 @@ async def find_model_pricing(
     charge line at the wrong unit for a rate nobody configured.
     """
 
+    resolved = await resolve_model_pricing(
+        db,
+        provider,
+        model,
+        as_of=as_of,
+        use_defaults=use_defaults,
+        organization_id=organization_id,
+    )
+    return resolved.pricing if resolved is not None else None
+
+
+class ResolvedPricing(NamedTuple):
+    """A resolved rate and which step of the lookup order supplied it."""
+
+    pricing: ModelPricing
+    source: PriceSource
+
+
+async def resolve_model_pricing(
+    db: AsyncSession,
+    provider: str | None,
+    model: str,
+    *,
+    as_of: datetime | None = None,
+    use_defaults: bool = True,
+    organization_id: uuid.UUID | None = None,
+) -> ResolvedPricing | None:
+    """:func:`find_model_pricing`, also reporting which source supplied the rate."""
     lookup_time = normalize_effective_at(as_of)
     model_key = f"{provider}:{model}" if provider else model
-    legacy_keys = [f"{provider}/{model}"] if provider else []
+    key_forms = pricing_key_forms(model_key)
+    legacy_keys = key_forms[1:]
 
     if organization_id is not None:
-        override = await _find_organization_override(db, organization_id, [model_key, *legacy_keys], lookup_time)
+        override = await _find_organization_override(db, organization_id, key_forms, lookup_time)
         if override is not None:
-            return override
+            return ResolvedPricing(override, "organization")
 
     pricing = await _find_by_model_key(db, model_key, lookup_time)
 
@@ -585,11 +779,15 @@ async def find_model_pricing(
         if pricing is not None:
             break
         pricing = await _find_by_model_key(db, legacy_key, lookup_time)
+    if pricing is not None:
+        return ResolvedPricing(pricing, "deployment")
 
-    if pricing is None and use_defaults and default_pricing_enabled():
-        pricing = default_model_pricing(provider, model, lookup_time)
+    if use_defaults and default_pricing_enabled():
+        default = default_model_pricing(provider, model, lookup_time)
+        if default is not None:
+            return ResolvedPricing(default, "defaults")
 
-    return pricing
+    return None
 
 
 # ``ModelPricing`` only has per-million-token rate columns, so endpoints whose
@@ -822,7 +1020,7 @@ async def _tool_rates(
             )
         )
         for override in (await db.execute(override_stmt)).scalars():
-            found[keys[override.model_key]] = _override_as_model_pricing(override)
+            found[keys[override.model_key]] = override_as_model_pricing(override)
 
     return found
 

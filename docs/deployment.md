@@ -11,6 +11,7 @@ A durable standalone deployment should:
 - use PostgreSQL and back it up
 - set a strong master key in a secret store
 - set and back up `OTARI_SECRET_KEY` when storing provider credentials
+- set `OTARI_PROVIDER_ACCOUNT_PEPPER` to its own random value while provider copies are on
 - configure explicit pricing or deliberately enable default pricing
 - terminate TLS in front of the gateway
 - restrict database and management access
@@ -18,6 +19,48 @@ A durable standalone deployment should:
 - pin an image version and test migrations before upgrading
 
 The default SQLite database is intended for evaluation and single-node local use.
+
+A `/metrics` scrape needs the `metrics` extra (`pip install gateway[metrics]`),
+which the Docker image installs. A source install that sets `enable_metrics`
+without it refuses to start rather than serving an empty scrape.
+
+### Behind a reverse proxy
+
+When TLS ends at a proxy or a platform ingress, each request reaches Otari from
+the proxy's address. The dashboard sign-in limit and the public-catalog limit
+count failures per client address, so all visitors then share one budget. Ten
+wrong passwords from one visitor lock everyone out of the dashboard for a
+minute.
+
+Set `forwarded_allow_ips` (`OTARI_FORWARDED_ALLOW_IPS`) to the proxy's
+addresses or networks, comma-separated, so Otari reads the client address from
+`X-Forwarded-For`. Use `*` only where the proxy is the sole path to the
+container, as on Railway: any peer in the list can set its own client address.
+When it is unset, uvicorn's `FORWARDED_ALLOW_IPS` applies, and without that
+only `127.0.0.1` is trusted.
+
+### Watch the connection pool
+
+On PostgreSQL the gateway serves requests from a fixed pool of database
+connections, and running out of them makes every request fail at once. `/metrics`
+reports the pool directly, labeled by `pool` (`request` for request traffic,
+`log` for the usage-log writer):
+
+| Metric | Meaning |
+| --- | --- |
+| `gateway_db_pool_connections_checked_out` | Connections in use right now |
+| `gateway_db_pool_connections_idle` | Connections available to hand out |
+| `gateway_db_pool_overflow_connections` | Connections open beyond the pool's base size |
+| `gateway_db_pool_capacity` | Ceiling on connections the pool hands out at once |
+
+The `request` pool is sized by `db_pool_size` and may open `db_max_overflow`
+connections beyond it, so its capacity is the two added together. The `log`
+pool is sized by `db_log_pool_size` and has no overflow, so its capacity is
+that value.
+
+Alert on checked-out connections approaching capacity for a sustained period.
+These metrics do not appear on SQLite, which opens a connection per use and
+keeps no pool.
 
 ## Docker Compose
 
@@ -89,7 +132,12 @@ Compose profiles start the bundled service backends:
 docker compose --profile code-exec up -d
 docker compose --profile web-search up -d
 docker compose --profile guardrails up -d
+docker compose --profile object-storage up -d
 ```
+
+The `object-storage` profile runs an S3-compatible store for uploaded files;
+[Object storage with Docker Compose](files.md#object-storage-with-docker-compose)
+has the settings that use it.
 
 Web search needs no container when `web_search_provider` names a licensed API
 (`tavily` or `brave`) and `web_search_provider_api_key` carries its key. These

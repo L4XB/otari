@@ -17,11 +17,12 @@ from gateway.api.routes._attempts import (
     ALL_ATTEMPTS_FAILED_DETAIL,
     ALL_ATTEMPTS_TIMED_OUT_DETAIL,
     EMPTY_PLAN_DETAIL,
+    CandidateCannotServe,
     classify_local_attempt_error,
     walk_attempts,
 )
 from gateway.services.mcp_loop import MaxToolIterationsExceeded
-from gateway.services.sandbox_backend import SandboxNotReachableError
+from gateway.services.sandbox_backend import SandboxNotReachableError, SandboxUnavailableError
 from gateway.types.attempt import Attempt
 
 
@@ -305,9 +306,7 @@ async def test_empty_plan_is_a_500_that_leaks_nothing() -> None:
         raise AssertionError("must not be called")
 
     with pytest.raises(HTTPException) as exc_info:
-        await walk_attempts(
-            attempts=[], base_request_fields={}, run_attempt=run_attempt, max_tool_iterations=10
-        )
+        await walk_attempts(attempts=[], base_request_fields={}, run_attempt=run_attempt, max_tool_iterations=10)
 
     assert exc_info.value.status_code == 500
     assert exc_info.value.detail == EMPTY_PLAN_DETAIL
@@ -384,6 +383,7 @@ def _request_context(plan: Any) -> Any:
     return RequestContext(
         config=GatewayConfig(),
         db=None,
+        uow=None,
         # No settlement happens in these tests; the merge reads only `ctx.plan`.
         log_writer=cast(Any, None),
         hybrid_mode=False,
@@ -401,9 +401,7 @@ def _request_context(plan: Any) -> Any:
 def _ctx_with_guardrails(*guardrails: Any) -> Any:
     from gateway.services.routing import CompiledPlan
 
-    return _request_context(
-        CompiledPlan(policy_name="p", attempts=[_attempt(1, "m")], guardrails=list(guardrails))
-    )
+    return _request_context(CompiledPlan(policy_name="p", attempts=[_attempt(1, "m")], guardrails=list(guardrails)))
 
 
 def _guardrail(
@@ -474,3 +472,174 @@ def test_an_unrouted_request_keeps_exactly_the_callers_guardrails() -> None:
     caller = [_guardrail("pii", mode="monitor")]
     assert merge_guardrail_layers(unrouted, caller, []).configs is caller
     assert merge_guardrail_layers(unrouted, None, []).configs is None
+
+
+@pytest.mark.asyncio
+async def test_capacity_failure_does_not_try_another_provider() -> None:
+    with pytest.raises(SandboxUnavailableError) as caught:
+        await _walk([_attempt(1, "a"), _attempt(2, "b")], [SandboxUnavailableError("15"), "ok"])
+    assert caught.value.retry_after == "15"
+
+
+# ---------------------------------------------------------------------------
+# Preparing each candidate
+# ---------------------------------------------------------------------------
+
+
+async def _walk_prepared(
+    attempts: list[Attempt], prepare: Any, behaviors: list[Any] | None = None
+) -> tuple[Attempt, list[dict[str, Any]]]:
+    sent: list[dict[str, Any]] = []
+
+    async def run_attempt(attempt: Attempt, call_kwargs: dict[str, Any], mark_locked_in: Any) -> Any:
+        sent.append(call_kwargs)
+        behavior = (behaviors or [])[attempt.position - 1] if behaviors else "ok"
+        if isinstance(behavior, BaseException):
+            raise behavior
+        return behavior
+
+    chosen, _ = await walk_attempts(
+        attempts=attempts,
+        base_request_fields={"messages": [{"role": "user", "content": "hi"}]},
+        run_attempt=run_attempt,
+        max_tool_iterations=10,
+        prepare_kwargs=prepare,
+    )
+    return chosen, sent
+
+
+@pytest.mark.asyncio
+async def test_each_candidate_is_sent_what_was_prepared_for_it() -> None:
+    async def prepare(instance: str, kwargs: dict[str, Any]) -> dict[str, Any]:
+        return {**kwargs, "prepared_for": instance}
+
+    attempts = [_attempt(1, "a", instance="first"), _attempt(2, "b", instance="second")]
+    _, sent = await _walk_prepared(attempts, prepare, [_http_error(503), "ok"])
+
+    assert [kwargs["prepared_for"] for kwargs in sent] == ["first", "second"]
+
+
+@pytest.mark.asyncio
+async def test_a_candidate_that_cannot_serve_is_skipped_without_reordering() -> None:
+    async def prepare(instance: str, kwargs: dict[str, Any]) -> dict[str, Any]:
+        if instance == "first":
+            raise CandidateCannotServe(HTTPException(status_code=400, detail="no"))
+        return kwargs
+
+    attempts = [_attempt(1, "a", instance="first"), _attempt(2, "b", instance="second")]
+    chosen, sent = await _walk_prepared(attempts, prepare)
+
+    assert chosen.instance == "second"
+    assert len(sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_no_candidate_that_can_serve_raises_the_refusal_it_was_given() -> None:
+    async def prepare(instance: str, kwargs: dict[str, Any]) -> dict[str, Any]:
+        raise CandidateCannotServe(HTTPException(status_code=400, detail="no model can"))
+
+    with pytest.raises(HTTPException) as exc_info:
+        await _walk_prepared([_attempt(1, "a"), _attempt(2, "b")], prepare)
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "no model can"
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_while_preparing_a_candidate_stops_the_walk() -> None:
+    async def prepare(instance: str, kwargs: dict[str, Any]) -> dict[str, Any]:
+        raise HTTPException(status_code=400, detail="refused")
+
+    with pytest.raises(HTTPException) as exc_info:
+        await _walk_prepared([_attempt(1, "a"), _attempt(2, "b")], prepare)
+
+    assert exc_info.value.detail == "refused"
+
+
+@pytest.mark.asyncio
+async def test_a_provider_failure_while_preparing_a_candidate_falls_over() -> None:
+    async def prepare(instance: str, kwargs: dict[str, Any]) -> dict[str, Any]:
+        if instance == "first":
+            raise _http_error(503)
+        return kwargs
+
+    attempts = [_attempt(1, "a", instance="first"), _attempt(2, "b", instance="second")]
+    chosen, _ = await _walk_prepared(attempts, prepare)
+
+    assert chosen.instance == "second"
+
+
+async def _walk_recording(
+    attempts: list[Attempt], prepare: Any, behaviors: list[Any]
+) -> tuple[list[Attempt], list[Attempt], BaseException | None]:
+    terminal: list[Attempt] = []
+    absorbed: list[Attempt] = []
+
+    async def run_attempt(attempt: Attempt, call_kwargs: dict[str, Any], mark_locked_in: Any) -> Any:
+        behavior = behaviors[attempt.position - 1]
+        if isinstance(behavior, BaseException):
+            raise behavior
+        return behavior
+
+    async def on_absorbed(attempt: Attempt, exc: BaseException, total: int) -> None:
+        absorbed.append(attempt)
+
+    try:
+        await walk_attempts(
+            attempts=attempts,
+            base_request_fields={"messages": []},
+            run_attempt=run_attempt,
+            max_tool_iterations=10,
+            prepare_kwargs=prepare,
+            on_absorbed=on_absorbed,
+            on_terminal=terminal.append,
+        )
+    except BaseException as exc:  # noqa: BLE001 - the test inspects what the walk raised
+        return terminal, absorbed, exc
+    return terminal, absorbed, None
+
+
+def _cannot_serve(*instances: str) -> Any:
+    async def prepare(instance: str, kwargs: dict[str, Any]) -> dict[str, Any]:
+        if instance in instances:
+            raise CandidateCannotServe(HTTPException(status_code=400, detail="no"))
+        return kwargs
+
+    return prepare
+
+
+@pytest.mark.asyncio
+async def test_a_failure_before_a_candidate_that_cannot_serve_is_the_requests_outcome() -> None:
+    attempts = [_attempt(1, "a", instance="first"), _attempt(2, "b", instance="second")]
+
+    terminal, absorbed, exc = await _walk_recording(attempts, _cannot_serve("second"), [_http_error(429), "ok"])
+
+    assert [attempt.instance for attempt in terminal] == ["first"]
+    assert absorbed == [], "the only provider called was recorded as a failure the request recovered from"
+    assert isinstance(exc, HTTPException)
+    assert exc.status_code == 429, "one candidate ran, so its own status is the answer"
+
+
+@pytest.mark.asyncio
+async def test_a_failure_after_a_candidate_that_cannot_serve_names_the_candidate_that_ran() -> None:
+    attempts = [_attempt(1, "a", instance="first"), _attempt(2, "b", instance="second")]
+
+    terminal, absorbed, exc = await _walk_recording(attempts, _cannot_serve("first"), ["ok", _http_error(429)])
+
+    assert [attempt.instance for attempt in terminal] == ["second"]
+    assert absorbed == []
+    assert isinstance(exc, HTTPException)
+    assert exc.status_code == 429
+
+
+@pytest.mark.asyncio
+async def test_a_failure_is_absorbed_once_another_candidate_is_sent_the_request() -> None:
+    attempts = [_attempt(1, "a", instance="first"), _attempt(2, "b"), _attempt(3, "c", instance="third")]
+
+    terminal, absorbed, exc = await _walk_recording(
+        attempts, _cannot_serve("openai"), [_http_error(503), "unused", "ok"]
+    )
+
+    assert exc is None
+    assert [attempt.instance for attempt in absorbed] == ["first"]
+    assert terminal == []

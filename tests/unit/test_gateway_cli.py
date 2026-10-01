@@ -1,6 +1,10 @@
 import logging
+import os
+import subprocess
 import sys
-from dataclasses import dataclass
+import textwrap
+from dataclasses import dataclass, field
+from pathlib import Path
 
 import pytest
 import uvicorn
@@ -16,6 +20,8 @@ class ServeCapture:
 
     log_level: int | None = None
     uvicorn_calls: int = 0
+    uvicorn_kwargs: dict[str, object] = field(default_factory=dict)
+    config: GatewayConfig = field(default_factory=lambda: GatewayConfig(master_key="test-master-key"))
 
 
 @pytest.fixture
@@ -29,7 +35,7 @@ def serve_stubs(monkeypatch: pytest.MonkeyPatch) -> ServeCapture:
     captured = ServeCapture()
 
     def fake_load_config(config_path: str | None = None) -> GatewayConfig:
-        return GatewayConfig(master_key="test-master-key")
+        return captured.config
 
     def fake_setup_logger(level: int) -> None:
         captured.log_level = level
@@ -39,10 +45,11 @@ def serve_stubs(monkeypatch: pytest.MonkeyPatch) -> ServeCapture:
 
     def fake_uvicorn_run(*args: object, **kwargs: object) -> None:
         captured.uvicorn_calls += 1
+        captured.uvicorn_kwargs = kwargs
 
     monkeypatch.setattr(gateway_cli, "load_config", fake_load_config)
     monkeypatch.setattr(gateway_cli, "setup_logger", fake_setup_logger)
-    monkeypatch.setattr(gateway_cli, "create_app", fake_create_app)
+    monkeypatch.setattr("gateway.main.create_app", fake_create_app)
     monkeypatch.setattr(uvicorn, "run", fake_uvicorn_run)
     return captured
 
@@ -86,6 +93,19 @@ def test_serve_workers_greater_than_one_is_rejected(serve_stubs: ServeCapture) -
     assert serve_stubs.uvicorn_calls == 0
 
 
+def test_serve_leaves_forwarded_allow_ips_to_uvicorn_when_unset(serve_stubs: ServeCapture) -> None:
+    result = CliRunner().invoke(gateway_cli.serve, [])
+    assert result.exit_code == 0, result.output
+    assert serve_stubs.uvicorn_kwargs["forwarded_allow_ips"] is None
+
+
+def test_serve_passes_forwarded_allow_ips_to_uvicorn(serve_stubs: ServeCapture) -> None:
+    serve_stubs.config = GatewayConfig(master_key="test-master-key", forwarded_allow_ips="*")
+    result = CliRunner().invoke(gateway_cli.serve, [])
+    assert result.exit_code == 0, result.output
+    assert serve_stubs.uvicorn_kwargs["forwarded_allow_ips"] == "*"
+
+
 def test_main_invokes_cli(monkeypatch: pytest.MonkeyPatch) -> None:
     called = False
 
@@ -99,6 +119,69 @@ def test_main_invokes_cli(monkeypatch: pytest.MonkeyPatch) -> None:
     gateway_cli.main()
 
     assert called
+
+
+def test_cli_import_does_not_load_server_application() -> None:
+    result = subprocess.run(
+        [sys.executable, "-c", "import gateway.cli, sys; assert 'gateway.main' not in sys.modules"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="The extraction address-space limit is enforced on Linux")
+def test_serve_can_spawn_memory_bounded_extraction(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Spawn reloads the launcher in the child, including its top-level CLI import.
+    launcher = tmp_path / "extraction_cli.py"
+    launcher.write_text(
+        textwrap.dedent(
+            """\
+            from gateway.cli import main
+
+            if __name__ == "__main__":
+                import asyncio
+                import uvicorn
+                from gateway.services.web_extraction import ExtractionSupervisor
+
+                async def extract():
+                    supervisor = ExtractionSupervisor()
+                    try:
+                        result = await supervisor.extract_html(
+                            "<html><body><article><h1>CLI extraction probe</h1>"
+                            "<p>The real worker must extract this document within its "
+                            "unchanged memory limit.</p></article></body></html>"
+                        )
+                        assert "CLI extraction probe" in result.text, result.text
+                    finally:
+                        supervisor.close()
+
+                def run_extraction(app, **kwargs):
+                    asyncio.run(extract())
+                    print("CLI_EXTRACTION_OK")
+
+                uvicorn.run = run_extraction
+                main()
+            """
+        )
+    )
+    config = tmp_path / "config.yml"
+    config.write_text("mode: standalone\nmaster_key: test-master-key\ndatabase_url: 'sqlite:///:memory:'\n")
+    for name in list(os.environ):
+        if name.startswith(("OTARI_", "GATEWAY_")):
+            monkeypatch.delenv(name)
+    result = subprocess.run(
+        [sys.executable, str(launcher), "serve", "--config", str(config)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "CLI_EXTRACTION_OK" in result.stdout
 
 
 def test_gateway_config_defaults_to_sqlite() -> None:
@@ -116,3 +199,13 @@ def test_gen_secret_key_prints_a_usable_fernet_key() -> None:
     # Round-trips through Fernet, so it is a valid key the secret box can use.
     box = Fernet(key.encode())
     assert box.decrypt(box.encrypt(b"x")) == b"x"
+
+
+def test_gen_provider_account_pepper_prints_a_pepper_the_gateway_accepts() -> None:
+    first = CliRunner().invoke(gateway_cli.cli, ["gen-provider-account-pepper"])
+    second = CliRunner().invoke(gateway_cli.cli, ["gen-provider-account-pepper"])
+
+    assert first.exit_code == 0
+    pepper = first.output.strip()
+    assert GatewayConfig(provider_account_pepper=pepper).provider_account_pepper == pepper
+    assert pepper != second.output.strip()

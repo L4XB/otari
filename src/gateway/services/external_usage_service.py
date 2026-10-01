@@ -30,7 +30,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from gateway.core.config import API_ROOT
 from gateway.core.metered_pricing import BillableUsage, ChargeLine, billable_usage, price_billable_usage
 from gateway.log_config import logger
-from gateway.models.entities import APIKey, ModelPricing, UsageLog, User
+from gateway.models.api_keys import APIKey
+from gateway.models.pricing import ModelPricing
+from gateway.models.usage import UsageLog
+from gateway.models.users import User
 from gateway.services.pricing_service import (
     OverridePeriod,
     default_model_pricing,
@@ -41,10 +44,12 @@ from gateway.services.pricing_service import (
 )
 from gateway.services.workspace_scope import organization_for_workspace_id, resolve_workspace_id
 
-# Bounds. Batch size mirrors the /v1/usage list `limit` cap; the error list is
-# capped so one bad batch can't return an unbounded payload; the IN() list is
-# chunked to stay under SQLite's default variable limit (999).
-MAX_EVENTS_PER_BATCH = 1000
+# Bounds. The batch cap is owned by the CLI's distribution (see
+# otari_agent.usage_import) and re-exported here for the OTLP route; the error
+# list is capped so one bad batch can't return an unbounded payload; the IN()
+# list is chunked to stay under SQLite's default variable limit (999).
+from otari_agent.usage_import import MAX_EVENTS_PER_BATCH as MAX_EVENTS_PER_BATCH
+
 _MAX_ERRORS = 100
 _IN_CHUNK = 500
 # Slug pattern for a source: keep provenance identifiers boring so they are safe to
@@ -109,6 +114,7 @@ class ExternalUsageEvent(BaseModel):
     cache_read_tokens: int = Field(default=0, ge=0, le=_MAX_TOKENS)
     cache_write_tokens: int = Field(default=0, ge=0, le=_MAX_TOKENS)
     cache_write_1h_tokens: int = Field(default=0, ge=0, le=_MAX_TOKENS)
+    reasoning_tokens: int = Field(default=0, ge=0, le=_MAX_TOKENS)
     # Whether ``input_tokens`` already includes the cache counts (OpenAI shape,
     # where ``cached_tokens`` is a subset of ``prompt_tokens``) or excludes them
     # (Anthropic / Claude Code shape, where the cache buckets are additive). The
@@ -379,6 +385,7 @@ def _build_row(
         cache_read_tokens=event.cache_read_tokens,
         cache_write_tokens=event.cache_write_tokens,
         cache_write_1h_tokens=event.cache_write_1h_tokens,
+        reasoning_tokens=event.reasoning_tokens,
         # Persist the convention the submitter stated, so a row repriced later
         # (POST /v1/usage/set-price) is priced the way it was reported rather than
         # the way its numbers happen to look. A row that arrives with no rate to

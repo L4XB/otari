@@ -29,6 +29,40 @@ const DISCOVERABLE = {
   ],
 }
 
+// The catalog route's shape: folded by model, each carrying the selectors that
+// serve it. An alias is a display name rather than a selector a provider
+// answers to, so it is not among them.
+const CATALOG = {
+  default_pricing: false,
+  defaults_as_of: null,
+  metadata_available: true,
+  count: 1,
+  models: [
+    {
+      id: "openai/gpt-5-mini",
+      name: "GPT-5 mini",
+      selectors: ["openai:gpt-5-mini"],
+    },
+  ],
+}
+
+// Per URL, because the point of `source` is that only one of the two reads is
+// ever made and a single blanket response would hide which.
+function mockBothSources() {
+  const urls: string[] = []
+  vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+    const url = String(input)
+    urls.push(url)
+    return new Response(
+      JSON.stringify(
+        url.includes("/models/discoverable") ? DISCOVERABLE : CATALOG,
+      ),
+      { status: 200, headers: { "Content-Type": "application/json" } },
+    )
+  })
+  return urls
+}
+
 function mockApi() {
   return vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
     return new Response(JSON.stringify(DISCOVERABLE), {
@@ -160,5 +194,98 @@ describe("ModelComboBox", () => {
     const line = captionLine(screen.getByText("Use instead"))
     expect(line).toHaveTextContent("Pick a model or type one.")
     expect(line).toHaveClass("min-h-[var(--text-caption-step--line-height)]")
+  })
+
+  describe("over the catalog", () => {
+    it("asks the catalog and leaves discovery alone", async () => {
+      // /v1/models/discoverable is a deployment-operator read, so a
+      // tenant-facing form making it would paint a refusal rather than a list.
+      const urls = mockBothSources()
+      renderWithClient(
+        <ModelComboBox
+          label="Model key"
+          value=""
+          onChange={() => {}}
+          source="catalog"
+        />,
+      )
+      await screen.findByRole("combobox", { name: "Model key" })
+      await vi.waitFor(() => {
+        expect(urls.some((url) => url.includes("/catalog/models"))).toBe(true)
+      })
+
+      expect(urls.some((url) => url.includes("/models/discoverable"))).toBe(
+        false,
+      )
+    })
+
+    it("sends the search to the server rather than filtering what it fetched", async () => {
+      // otari#1380. Filtering the page it had fetched offered a subset of the
+      // catalog and said nothing about it, so a search for a model that exists
+      // could answer that there is none.
+      const urls = mockBothSources()
+      renderWithClient(
+        <ModelComboBox
+          label="Model key"
+          value="gpt"
+          onChange={() => {}}
+          source="catalog"
+        />,
+      )
+      await screen.findByRole("combobox", { name: "Model key" })
+
+      await vi.waitFor(() => {
+        expect(
+          urls.some((url) =>
+            url.includes("/catalog/models?limit=51&search=gpt"),
+          ),
+        ).toBe(true)
+      })
+    })
+
+    it("offers what the catalog serves, and not the names that only stand for it", async () => {
+      mockBothSources()
+      renderWithClient(
+        <ModelComboBox
+          label="Model key"
+          value=""
+          onChange={() => {}}
+          source="catalog"
+        />,
+      )
+      await screen.findByRole("combobox", { name: "Model key" })
+
+      await userEvent.click(screen.getByRole("button"))
+
+      expect(
+        await screen.findByRole("option", { name: "openai:gpt-5-mini" }),
+      ).toBeInTheDocument()
+      expect(screen.queryByRole("option", { name: "fast" })).toBeNull()
+    })
+
+    it("announces a correction beside the hint rather than in place of it", async () => {
+      // The hint line carries "Showing 50 of 210 matches" while a search is
+      // being narrowed, which is exactly when a form is most likely to have a
+      // correction to make.
+      mockBothSources()
+      renderWithClient(
+        <ModelComboBox
+          label="Model key"
+          value="gpt"
+          onChange={() => {}}
+          source="catalog"
+          description="For example openai:gpt-4o."
+          isInvalid
+          errorMessage="It needs the provider prefix."
+        />,
+      )
+      const input = await screen.findByRole("combobox", { name: "Model key" })
+
+      expect(
+        await screen.findByText("It needs the provider prefix."),
+      ).toBeInTheDocument()
+      expect(screen.getByText("For example openai:gpt-4o.")).toBeInTheDocument()
+      expect(input).toHaveAttribute("aria-invalid", "true")
+    })
   })
 })

@@ -27,10 +27,13 @@ from gateway.core.sql import (
     match_any,
     utc_bound,
 )
+from gateway.core.surface import Surface
 from gateway.core.usage_source import is_served_here, not_served_here
 from gateway.inflight import get_registry
-from gateway.models.entities import APIKey, UsageLog, User
+from gateway.models.api_keys import APIKey
 from gateway.models.money import as_float
+from gateway.models.usage import UsageLog
+from gateway.models.users import User
 from gateway.services.external_usage_service import (
     ExternalEventsRequest,
     ExternalIngestResult,
@@ -46,7 +49,7 @@ from gateway.services.usage_admin_service import (
     delete_usage,
     set_usage_price,
 )
-from gateway.services.web_search_backend import WEB_SEARCH_TOOL_NAME
+from gateway.services.web_retrieval_backend import WEB_FETCH_TOOL_NAME, WEB_SEARCH_TOOL_NAME
 
 # Two routers under one prefix, because the two planes that meet here
 # authenticate differently. Reading or amending every tenant's usage rows is
@@ -66,6 +69,8 @@ ingest_router = APIRouter(
     tags=["usage"],
     dependencies=[Depends(verify_api_key_or_master_key)],
 )
+
+SURFACE = Surface("usage")
 
 # The analytics summary is range-bounded, unlike the raw list. Absent a start_date
 # it looks back this far; a wider explicit window is clamped to the hard cap so a
@@ -149,9 +154,13 @@ _ERROR_TAXONOMY_DIMENSION = "status_code"
 # tool names come from a caller-supplied server, so they are unbounded and appear
 # only in a row's own detail, never as a dimension of their own. The ``any``
 # selector still matches them, because it tests the meter namespace itself.
-GATEWAY_TOOL_NAMES: tuple[str, ...] = (WEB_SEARCH_TOOL_NAME, CODE_EXECUTION_TOOL_NAME)
+GATEWAY_TOOL_NAMES: tuple[str, ...] = (
+    WEB_SEARCH_TOOL_NAME,
+    WEB_FETCH_TOOL_NAME,
+    CODE_EXECUTION_TOOL_NAME,
+)
 _ANY_TOOL = "any"
-ToolFilter = Literal["any", "web_search", "code_execution"]
+ToolFilter = Literal["any", "web_search", "web_fetch", "code_execution"]
 
 # Keep in step with _SUMMARY_DIMENSIONS; the extra ``none`` is the explicit empty
 # selection (a repeated query param cannot express an empty list on the wire).
@@ -199,6 +208,8 @@ class UsageEntry(BaseModel):
     cache_read_tokens: int | None
     cache_write_tokens: int | None
     cache_write_1h_tokens: int | None
+    # A subset of completion_tokens; null on rows written before it was recorded.
+    reasoning_tokens: int | None = None
     # Precise shapes with a permissive fallback arm; see _billing_schemas for why
     # the fallback is what keeps a row written by an older gateway renderable.
     billing_meters: MeterMap | None
@@ -255,6 +266,7 @@ class UsageEntry(BaseModel):
             cache_read_tokens=log.cache_read_tokens,
             cache_write_tokens=log.cache_write_tokens,
             cache_write_1h_tokens=log.cache_write_1h_tokens,
+            reasoning_tokens=log.reasoning_tokens,
             billing_meters=log.billing_meters,
             pricing_breakdown=log.pricing_breakdown,
             cost=as_float(log.cost),
@@ -734,6 +746,7 @@ class UsageTotals(BaseModel):
     cache_read_tokens: int
     cache_write_tokens: int
     cache_write_1h_tokens: int
+    reasoning_tokens: int = 0
     request_count: int
     error_count: int
     avg_latency_ms: float | None
@@ -1094,6 +1107,7 @@ async def _totals(
                 ),
                 _billed_input_sum(),
                 _billed_output_sum(),
+                func.coalesce(func.sum(UsageLog.reasoning_tokens), 0),
             ).where(*conditions)
         )
     ).one()
@@ -1111,6 +1125,7 @@ async def _totals(
         unpriced_requests=int(row[10]),
         billed_input_tokens=int(row[11]),
         billed_output_tokens=int(row[12]),
+        reasoning_tokens=int(row[13]),
     )
 
 

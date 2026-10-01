@@ -18,7 +18,8 @@ from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
 from gateway.core.config import API_ROOT
-from gateway.models.entities import UsageLog, User
+from gateway.models.usage import UsageLog
+from gateway.models.users import User
 
 
 def _usd(tokens: int, rate_per_million: str) -> Decimal:
@@ -52,9 +53,11 @@ def _api_request_record(source_event_id: str = "req_otlp_1", **over: Any) -> dic
         "user.email": "nathan@example.com",  # present but must never be persisted
         **over,
     }
-    return {"timeUnixNano": "1784000000000000000", "body": {"stringValue": "api_request"}, "attributes": [
-        _attr(k, v) for k, v in attrs.items()
-    ]}
+    return {
+        "timeUnixNano": "1784000000000000000",
+        "body": {"stringValue": "api_request"},
+        "attributes": [_attr(k, v) for k, v in attrs.items()],
+    }
 
 
 def _otlp(*records: dict[str, Any]) -> dict[str, Any]:
@@ -272,7 +275,7 @@ def test_otlp_codex_sse_event_is_ingested_and_priced(
     headers = _exempt_key(client, master_key_header)
     _seed_codex_pricing(client, master_key_header)
 
-    resp = client.post(_PATH, json=_otlp(_codex_sse_record()), headers=headers)
+    resp = client.post(_PATH, json=_otlp(_codex_sse_record(reasoning_token_count=40)), headers=headers)
     assert resp.status_code == 200, resp.text
 
     rows = db_session.query(UsageLog).filter(UsageLog.source == "codex").all()
@@ -284,6 +287,8 @@ def test_otlp_codex_sse_event_is_ingested_and_priced(
     assert row.source_label == "conv-abc"  # conversation.id
     # Raw counts stored as reported; input stays inclusive of the cached slice.
     assert row.prompt_tokens == 1000 and row.completion_tokens == 100 and row.cache_read_tokens == 200
+    assert row.reasoning_tokens == 40
+    # Reasoning sits inside the 100 output tokens, so it adds nothing to the price.
     # De-included price: cached 200 billed once at the cache-read rate, not twice.
     expected = _usd(800, "0.15") + _usd(200, "0.075") + _usd(100, "0.6")
     assert row.cost == expected
@@ -361,16 +366,18 @@ def test_otlp_codex_protobuf_roundtrip(
         value = AnyValue(string_value=s) if s is not None else AnyValue(int_value=i or 0)
         return KeyValue(key=key, value=value)
 
-    record.attributes.extend([
-        kv("event.name", s="codex.sse_event"),
-        kv("event.kind", s="response.completed"),
-        kv("event.timestamp", s="2026-07-23T20:04:22.609Z"),
-        kv("model", s="gpt-4o-mini"),
-        kv("conversation.id", s="conv-pb"),
-        kv("input_token_count", i=1000),
-        kv("output_token_count", i=100),
-        kv("cached_token_count", i=200),
-    ])
+    record.attributes.extend(
+        [
+            kv("event.name", s="codex.sse_event"),
+            kv("event.kind", s="response.completed"),
+            kv("event.timestamp", s="2026-07-23T20:04:22.609Z"),
+            kv("model", s="gpt-4o-mini"),
+            kv("conversation.id", s="conv-pb"),
+            kv("input_token_count", i=1000),
+            kv("output_token_count", i=100),
+            kv("cached_token_count", i=200),
+        ]
+    )
     resp = client.post(_PATH, content=req.SerializeToString(), headers=headers)
     assert resp.status_code == 200, resp.text
     assert resp.headers["content-type"].startswith("application/x-protobuf")
@@ -394,13 +401,15 @@ def test_otlp_traces_protobuf_roundtrip(
         value = AnyValue(string_value=s) if s is not None else AnyValue(int_value=i or 0)
         return KeyValue(key=key, value=value)
 
-    span.attributes.extend([
-        kv("gen_ai.provider.name", s="anthropic"),
-        kv("gen_ai.request.model", s="claude-sonnet-4-6"),
-        kv("gen_ai.response.id", s="resp_pb_1"),
-        kv("gen_ai.usage.input_tokens", i=10),
-        kv("gen_ai.usage.output_tokens", i=20),
-    ])
+    span.attributes.extend(
+        [
+            kv("gen_ai.provider.name", s="anthropic"),
+            kv("gen_ai.request.model", s="claude-sonnet-4-6"),
+            kv("gen_ai.response.id", s="resp_pb_1"),
+            kv("gen_ai.usage.input_tokens", i=10),
+            kv("gen_ai.usage.output_tokens", i=20),
+        ]
+    )
     resp = client.post("/otlp/v1/traces", content=req.SerializeToString(), headers=headers)
     assert resp.status_code == 200, resp.text
     assert resp.headers["content-type"].startswith("application/x-protobuf")

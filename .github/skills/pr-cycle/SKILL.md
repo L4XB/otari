@@ -40,7 +40,9 @@ artifacts.
 7. **Open the PR** against `mozilla-ai/otari` with `Fixes #<n>`. The **title must be a
    Conventional Commit** (`otari-pr-title.yml` gates it; accepted types are `feat`, `fix`,
    `perf`, `security`, `revert`, `chore`, `build`, `ci`, `docs`, `style`, `refactor`, `test`),
-   because the repo squash-merges and git-cliff parses that title into the changelog. Keep the
+   because the repo squash-merges and git-cliff parses that title into the changelog. A breaking
+   change carries `!` after the type or scope; see
+   [Breaking changes](../../../RELEASE.md#breaking-changes). Keep the
    template's `## PR Type`, `## Checklist` and `## AI Usage` sections: `pr-template-check.yml`
    fails and labels the PR `missing-template` if any of the three is absent. Fill in AI Usage
    honestly, including the AI-agent checkbox. Two further sections are expected on every PR
@@ -111,19 +113,30 @@ PR with almost no CI, and neither of them reports anything:
   every head after a push, and the floor is two and then one. Measured on four stacked heads: one
   row each, `Lint PR title`, with no `check-template` on any of them. Keep a stacked PR on base `main` and
   live with the inherited diff until its parent merges.
+
+  A GitHub stack is the exception. A PR that `gh stack submit` (the `github/gh-stack`
+  extension) opens on its parent's branch still runs the workflows filtered on `main`: #1816
+  ran the full set, the hybrid and Docker smokes included. So stack with `gh stack`. Everything
+  above describes a PR whose base was set to another branch by hand.
 - **A `CONFLICTING` PR.** A `pull_request` workflow builds the PR's merge ref, and a conflicting
   PR has none, so nothing runs until the conflict is resolved. The tell is
-  `mergeStateStatus: DIRTY` beside a check count that has stopped growing.
+  `mergeStateStatus: DIRTY` beside a check set that is not growing, and read that tell as "not
+  growing" rather than as "small": a PR that was mergeable when its checks ran and conflicted
+  afterwards keeps every one of those rows, so `DIRTY` beside a **complete** green set is the
+  same fault from the other end. Checks attach to the SHA used by that workflow run, so nothing
+  about them changes when the mergeability underneath them does; four PRs based on `main` but
+  stacked in content showed a full green set for the parent's pre-merge state within a minute of that parent
+  squashing. `DIRTY` plus finished means re-verify after the rebase, and until then the set says
+  only that the content merged with an earlier `main`.
 
 A child PR hits the second case as soon as its parent is squash-merged, because its own
 unsquashed commits and the squash on `main` are the same content twice.
 `git rebase --onto origin/main <the parent's old head>` drops the absorbed commits and clears it.
 
-**"Green" means the full expected set is present and none of it is pending**, which is not the
-same as nothing being pending. Both situations above produce a `gh pr checks` that lists one or
-two passing rows, and a passing row reads as a clean result to anyone who does not already know
-what the set should be. Check the names rather than only the buckets: on a dashboard change the
-substantive ones are `build`, `dashboard`, `e2e`, `catalog` and `serving`, and a run without
+**"Green" means the PR is mergeable and the full expected set has passed**, not merely that
+nothing is pending. A base other than `main` can produce a `gh pr checks` that lists only one or
+two passing rows, which can look complete to someone who does not know what the set should be.
+Check the names rather than only the buckets: on a dashboard change the substantive ones are `build`, `dashboard`, `e2e`, `catalog` and `serving`, and a run without
 them has covered nothing.
 
 A small set is not always one of the two faults above, though. Every one of these workflows also
@@ -158,8 +171,9 @@ attempt fails silently rather than erroring: `POST /pulls/<n>/requested_reviewer
 poll for its review waits out the timeout on a bot that was never coming.
 
 - **Team.** `gh pr edit <n> --add-reviewer mozilla-ai/otari-team`. CODEOWNERS auto-requests that
-  team only on the open-core guardrail paths (`ARCHITECTURE.md`, `scripts/check_architecture.py`,
-  `.github/CODEOWNERS`), so every other PR needs the request made explicitly.
+  team only on the open-core guardrail paths it lists (`.github/CODEOWNERS`), so every other PR
+  needs the request made explicitly. Once the `main` ruleset requires code-owner review, a PR
+  touching one of those paths cannot merge on an approval from anyone else.
 
 ## Handling the review
 
@@ -221,6 +235,10 @@ tool, `isolation: "worktree"`), each executing the cycle above.
   (it posts a "Review skipped" comment saying so); trigger it with a `@coderabbitai review`
   comment. Neither is a reason not to stack, and both are reasons to say in the PR body that it
   is stacked and what has to happen before the parent merges.
+
+  That is a PR stacked by hand. In a GitHub stack made with `gh stack`, the child ran the full CI
+  set, and CodeRabbit reviewed it with no trigger. Whether `protect-main` applies to it is not
+  verified, so get a human approval on every PR in the stack regardless.
 - **Branch shape.** Squash and rebase merges are enabled and **merge commits are disabled**, so a
   branch collapses to one commit on `main` and its internal shape never lands. Still update with
   `git rebase origin/main` and `git push --force-with-lease` rather than merging `main` in: the
@@ -272,6 +290,10 @@ tool, `isolation: "worktree"`), each executing the cycle above.
   [What CI runs on a PR](#what-ci-runs-on-a-pr-and-the-two-ways-it-silently-does-not)), so it is
   where a stacked PR should have been sitting all along. If B already closed this way, the only recovery is a fresh PR from B's head branch, linking
   the old one for its review history.
+
+  A GitHub stack made with `gh stack` does not hit this trap. Merging the stack landed each PR
+  on `main` as its own squash commit, and the child was not closed, although its base was still
+  the parent's branch. Retarget by hand only a PR that was stacked by hand.
 
 ## Non-negotiables
 

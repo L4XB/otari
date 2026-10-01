@@ -1,7 +1,7 @@
-import { Button } from "@heroui/react"
 import type { ReactElement, ReactNode } from "react"
 import { useEffect, useId, useLayoutEffect, useRef, useState } from "react"
-import { FiEye, FiEyeOff } from "react-icons/fi"
+import { FiCheck, FiCopy, FiEye, FiEyeOff } from "react-icons/fi"
+import { Button } from "@/design-system/actions/Button"
 import { CopyButton } from "@/design-system/actions/CopyButton"
 import { copyToClipboard } from "@/design-system/helpers/clipboard"
 
@@ -65,15 +65,41 @@ export function CopyableValue({
  */
 export const CONCEALED_SECRET = "••••••••••••••••"
 
+/**
+ * A credential's stand-in that still identifies it: the fingerprint the server
+ * stored for the key, a fixed bullet run, then the stored suffix.
+ *
+ * Shown where an operator has to tell one key from another while it is
+ * concealed. Built from the `key_prefix` and `key_suffix` the create response
+ * carries rather than sliced off the plaintext here, so the reveal shows the
+ * same fingerprint the Keys table will, whatever length the bound key format
+ * gives its prefix. The bullet run is fixed for `CONCEALED_SECRET`'s reason, so
+ * the length of the key stays off the screen. A response with no fingerprint
+ * falls back to the plain stand-in.
+ */
+export function concealedFingerprint(
+  keyPrefix: string | undefined,
+  keySuffix: string | undefined,
+): string {
+  return keyPrefix ? `${keyPrefix}••••••••${keySuffix ?? ""}` : CONCEALED_SECRET
+}
+
+// A 44x44 target below `md` for an icon-only control, back to the button's own
+// 32px where a pointer is doing the pressing. A `before:` bleed is unavailable
+// here: the two controls sit a `gap-1` apart, so their bleeds would overlap and
+// a press near the seam would land on the wrong one.
+const ICON_CONTROL_BOX = "min-h-11 min-w-11 md:min-h-8 md:min-w-8"
+
 // A readonly, always-selectable field with a copy button: how a value an
 // operator has to paste elsewhere is handed over. Shared by the Keys page's
 // one-time reveal and the setup guide, which hand out the same key and the same
 // snippets.
 //
-// The Clipboard API is undefined on the non-secure origins this dashboard is
-// routinely served from, so the text is selected on click and Ctrl/Cmd-C always
-// works even when the button cannot copy programmatically. "Copied" is only
-// claimed when it truly copied.
+// The async Clipboard API is undefined on the non-secure origins this dashboard
+// is routinely served from, so every copy path here goes through
+// `copyToClipboard` and its offscreen-textarea fallback. The text is also
+// selected on click, so Ctrl/Cmd-C still works when even that is refused.
+// "Copied" is only claimed when it truly copied.
 //
 // The label is a real `<label>` for the field, not a caption beside it: these
 // values are handed over in pairs and threes (a key and two snippets), so
@@ -88,21 +114,19 @@ type CopyFieldProps = {
   fieldRef?: React.RefObject<HTMLInputElement | HTMLTextAreaElement | null>
 } & (
   | {
-      multiline?: boolean
+      isMultiline?: boolean
       /**
        * What the field shows until the operator asks for the value, for a value
        * that carries a credential: the plaintext reaches the DOM only once it
        * has been asked for, while Copy copies the real value either way, so a
        * key can be handed over without being read off the screen (otari-ai#2111).
        *
-       * The one-time secret step is the exception and opens revealed, by product
-       * ruling: that screen exists to hand the key over, and there is no second
-       * chance to read it. The toggle and copying without reading survive there,
-       * which is what otari-ai#2111 asked for.
-       *
-       * A whole-value field passes `CONCEALED_SECRET`. A snippet passes the same
-       * snippet built around that stand-in, so what is hidden is the key rather
-       * than the request that explains it.
+       * A whole-value field passes `CONCEALED_SECRET`, or
+       * `concealedFingerprint` where the operator has to tell one credential
+       * from another. A snippet passes the same snippet built around whichever
+       * of those the field beside it shows, so what is hidden is the key rather
+       * than the request that explains it, and one credential does not wear two
+       * stand-ins on one screen.
        */
       concealed?: string
       /**
@@ -137,7 +161,7 @@ type CopyFieldProps = {
       action?: never
     }
   | {
-      multiline?: false
+      isMultiline?: false
       /** Nothing hands out a credential beside a domain-verification action. */
       concealed?: never
       isRevealed?: never
@@ -159,7 +183,7 @@ type CopyFieldProps = {
 export function CopyField({
   label,
   value,
-  multiline = false,
+  isMultiline = false,
   fieldRef,
   action,
   concealed,
@@ -185,7 +209,7 @@ export function CopyField({
   const [selectHintFor, setSelectHintFor] = useState<string | undefined>(
     undefined,
   )
-  const revealed = isRevealed ?? revealedValue === value
+  const isValueRevealed = isRevealed ?? revealedValue === value
   const setRevealed = (next: boolean) => {
     onRevealChange?.(next)
     if (isRevealed === undefined) setRevealedValue(next ? value : undefined)
@@ -227,12 +251,12 @@ export function CopyField({
     // Only once the reveal has landed on the value the copy was for. Another
     // credential arriving in the meantime is concealed, and selecting its
     // stand-in is exactly what this is here to avoid.
-    if (!revealed || value !== wanted) return
+    if (!isValueRevealed || value !== wanted) return
     ref.current?.focus()
     ref.current?.select()
-  }, [revealed, value, ref])
+  }, [isValueRevealed, value, ref])
 
-  const isConcealed = concealed !== undefined && !revealed
+  const isConcealed = concealed !== undefined && !isValueRevealed
   const shown = isConcealed ? concealed : value
 
   const acknowledgeCopy = () => {
@@ -268,19 +292,24 @@ export function CopyField({
       setSelectHintFor(copying)
       return
     }
+    // The same helper the concealed path above uses, rather than
+    // `navigator.clipboard` alone: the async Clipboard API is gated on a secure
+    // context and this dashboard is routinely served from a plain-HTTP LAN
+    // address, where it is undefined. The helper falls back to an offscreen
+    // textarea and `execCommand`, which is the only clipboard write such an
+    // origin has (otari#957).
+    if (await copyToClipboard(value)) {
+      acknowledgeCopy()
+      return
+    }
+    // Nothing could write, so the value is selected for Ctrl/Cmd-C instead, and
+    // the copy is never claimed. Selected only now rather than before the
+    // attempt, which is the order the `action` arrangement above already keeps:
+    // `legacyCopy` restores whatever selection and focus it found on its way
+    // out, so a selection made first is undone by the fallback itself, and a
+    // successful copy has no business moving the operator's selection either.
     ref.current?.focus()
     ref.current?.select()
-    try {
-      if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(value)
-        acknowledgeCopy()
-        return
-      }
-    } catch {
-      // fall through to the manual path
-    }
-    // No Clipboard API (or it threw): the text is selected, so the operator can
-    // press Ctrl/Cmd-C. Never claim it was copied.
     setSelectHintFor(value)
   }
 
@@ -306,7 +335,7 @@ export function CopyField({
               ref={ref as React.RefObject<HTMLInputElement>}
               readOnly
               value={value}
-              onFocus={(e) => e.currentTarget.select()}
+              onFocus={(event) => event.currentTarget.select()}
               // Right padding clears the control rather than the value running
               // under it, and the field grows below `md` so the 44px touch
               // floor fits between its borders. The value is never truncated:
@@ -355,10 +384,13 @@ export function CopyField({
       size="sm"
       variant="ghost"
       isIconOnly
-      aria-label={`${revealed ? "Hide" : "Show"} ${label}`}
-      onPress={() => setRevealed(!revealed)}
+      // `size` alone is 32px, under the 44px touch floor. Grow the box below
+      // `md` and let it settle back to the button's own size on a pointer.
+      className={ICON_CONTROL_BOX}
+      aria-label={`${isValueRevealed ? "Hide" : "Show"} ${label}`}
+      onPress={() => setRevealed(!isValueRevealed)}
     >
-      {revealed ? (
+      {isValueRevealed ? (
         <FiEyeOff aria-hidden="true" className="h-3.5 w-3.5" />
       ) : (
         <FiEye aria-hidden="true" className="h-3.5 w-3.5" />
@@ -366,7 +398,31 @@ export function CopyField({
     </Button>
   )
 
-  const field = multiline ? (
+  const inlineControls = concealed !== undefined && !isMultiline
+  const copyButton = (
+    <Button
+      size="sm"
+      variant="ghost"
+      isIconOnly={inlineControls}
+      className={inlineControls ? ICON_CONTROL_BOX : "min-h-11 md:min-h-8"}
+      aria-label={inlineControls ? `Copy ${label}` : undefined}
+      onPress={copy}
+    >
+      {inlineControls ? (
+        copied ? (
+          <FiCheck aria-hidden="true" className="h-3.5 w-3.5" />
+        ) : (
+          <FiCopy aria-hidden="true" className="h-3.5 w-3.5" />
+        )
+      ) : copied ? (
+        "Copied"
+      ) : (
+        "Copy"
+      )}
+    </Button>
+  )
+
+  const field = isMultiline ? (
     <textarea
       id={fieldId}
       ref={ref as React.RefObject<HTMLTextAreaElement>}
@@ -384,13 +440,13 @@ export function CopyField({
       readOnly
       value={shown}
       onFocus={selectUnlessConcealed}
-      // Concealed, the right padding clears the toggle rather than the value
+      // Concealed, the right padding clears both controls rather than the value
       // running under it, and the field grows below `md` so the 44px touch
       // floor fits between its borders.
       className={
         concealed === undefined
           ? shared
-          : `${shared} min-h-[2.875rem] pr-14 md:min-h-0 md:pr-11`
+          : `${shared} min-h-[2.875rem] pr-24 md:min-h-0 md:pr-20`
       }
       {...credentialProps}
     />
@@ -408,24 +464,23 @@ export function CopyField({
           {/* A snippet's toggle sits in the label row rather than in the field,
               for the reason `action` is barred from the multiline variant at
               all: right padding on a textarea indents every line of it. */}
-          {concealed !== undefined && multiline ? revealToggle : null}
-          <Button size="sm" variant="ghost" onPress={copy}>
-            {copied ? "Copied" : "Copy"}
-          </Button>
+          {concealed !== undefined && isMultiline ? revealToggle : null}
+          {!inlineControls ? copyButton : null}
         </div>
       </div>
-      {concealed !== undefined && !multiline ? (
+      {concealed !== undefined && !isMultiline ? (
         <div className="relative">
           {field}
-          <span className="absolute top-1/2 right-1 -translate-y-1/2">
+          <span className="absolute top-1/2 right-1 flex -translate-y-1/2 items-center gap-1">
             {revealToggle}
+            {copyButton}
           </span>
         </div>
       ) : (
         field
       )}
       {/* Announce only the "Copied" event, never the secret itself. */}
-      <span aria-live="polite" className="text-xs text-success">
+      <span aria-live="polite" className="sr-only">
         {copied ? "Copied to clipboard." : ""}
       </span>
       {selectHint ? (

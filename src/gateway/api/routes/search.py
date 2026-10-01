@@ -55,7 +55,6 @@ from gateway.api.routes._passthrough import (
     resolve_passthrough_user_id,
 )
 from gateway.api.routes._pipeline import (
-    WEB_SEARCH_NOT_ENABLED_DETAIL,
     _elapsed_ms,
     failure_status_code,
     log_gateway_rejection,
@@ -63,15 +62,16 @@ from gateway.api.routes._pipeline import (
 )
 from gateway.core.config import GatewayConfig
 from gateway.core.metered_pricing import quantize_cost
+from gateway.exceptions.tools_exceptions import WebSearchNotEnabledError, WebSearchPolicyResolutionFailure
 from gateway.inflight import track_request
 from gateway.log_config import logger
-from gateway.models.entities import APIKey, UsageLog
+from gateway.models.api_keys import APIKey
+from gateway.models.usage import UsageLog
 from gateway.rate_limit import check_rate_limit
-from gateway.services.budget_service import reconcile_reservation, refund_reservation, reserve_budget
+from gateway.services.budgets import BudgetScopeRequest, reconcile_reservation, refund_reservation, reserve_budget
 from gateway.services.log_writer import LogWriter
 from gateway.services.model_access import is_model_allowed, model_not_allowed_detail, resolve_request_allowlist
 from gateway.services.pricing_service import find_model_pricing, flat_request_cost
-from gateway.services.scoped_budget_service import BudgetScopeRequest
 from gateway.services.search_backend import (
     MAX_RESULTS_CAP,
     SearchHit,
@@ -81,7 +81,10 @@ from gateway.services.search_backend import (
     resolve_search_tool,
     run_search,
 )
-from gateway.services.tenancy.workspace_web_search_service import resolve_workspace_web_search_config
+from gateway.services.tenancy.workspace_web_search_service import (
+    InvalidStoredWebSearchDomainError,
+    resolve_workspace_web_search_config,
+)
 from gateway.services.workspace_scope import organization_for_key_id, workspace_for_key_id
 
 router = APIRouter(tags=["search"])
@@ -302,15 +305,26 @@ async def _dispatch_search(
     # workspace, which is a policy that fails open. Only the veto applies; the
     # row's other fields shape the in-loop backend's own request and have no
     # counterpart in this endpoint's provider adapters.
-    workspace_search = await resolve_workspace_web_search_config(db, usage_workspace_id)
-    if workspace_search is not None and not workspace_search.enabled:
+    try:
+        workspace_search = await resolve_workspace_web_search_config(db, usage_workspace_id)
+    except InvalidStoredWebSearchDomainError as exc:
+        invalid = WebSearchPolicyResolutionFailure.STORED_POLICY_INVALID
         await log_rejection(
-            WEB_SEARCH_NOT_ENABLED_DETAIL,
+            invalid.message,
+            row_model=tool.name,
+            row_provider=tool.provider,
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=invalid.message) from exc
+    if workspace_search is not None and not workspace_search.enabled:
+        refusal = WebSearchNotEnabledError()
+        await log_rejection(
+            refusal.message,
             row_model=tool.name,
             row_provider=tool.provider,
             status_code=status.HTTP_403_FORBIDDEN,
         )
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=WEB_SEARCH_NOT_ENABLED_DETAIL)
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=refusal.message)
 
     pricing_key = f"{tool.provider}:{tool.name}"
 

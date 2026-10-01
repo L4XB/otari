@@ -138,11 +138,33 @@ Sessions are revocable and expire after `dashboard_session_ttl_hours`. Password
 changes, master-key rotation, sign-out, and identity deactivation revoke relevant
 sessions.
 
+A session authorizes the management API. It does not authorize
+`/api/v1/chat/completions` or any other data-plane path, which take an API key
+or the master key and nothing else: a keyless request resolves to the
+deployment's default workspace, so honoring a cookie there would let any member
+of any organization spend that workspace's provider credential.
+
+The Playground is the one surface that runs a completion from a session, and it
+is a separate endpoint rather than a relaxation of that rule.
+`POST /api/v1/playground/chat/completions` resolves the caller's own attribution
+user and proves their membership of the workspace it will bill before the
+request reaches the pipeline, so the request is billed to the person who sent it
+in a workspace that is theirs. No credential is minted for the browser and none
+is held there. The usage row it writes carries no `api_key_id` and its own
+endpoint label, which is what keeps in-product traffic separable from a
+customer's integration.
+
 ### Passkeys
 
 Passkeys are optional and additive to password sign-in. Set
 `public_base_url` to establish the origin and relying-party ID. Use
 `webauthn_rp_id` only when passkeys must be bound to a parent domain.
+
+Where an edge serves the dashboard on a different host to the gateway, set
+`webauthn_rp_id` to a domain that is a parent of both and list the dashboard
+origin in `webauthn_allowed_origins`. The ID is not derived from `ui_base_url`,
+so without this the ceremony fails in the browser and nothing is logged here
+([#1134](https://github.com/mozilla-ai/otari/issues/1134)).
 
 Changing the relying-party ID makes existing passkeys unusable. The dashboard
 continues listing unusable credentials so the owner can remove them.
@@ -156,8 +178,14 @@ secret. Register this redirect URI with the provider:
 {public_base_url}/auth/{provider}/callback
 ```
 
+The gateway answers that path itself and redirects the browser into the
+dashboard to finish. Where an edge serves the dashboard elsewhere, set
+`ui_base_url` too; see [Configuration](configuration.md#the-interface-address).
+
 OAuth signs in an existing Otari identity whose email the provider verifies. It
 does not provision arbitrary provider accounts.
+
+A provider sign-in on an address that is not yet verified marks it verified. It also removes any password and verification link set on that address before then: the provider confirms who owns the address, not who chose that password. The person can set a new password from their account page once signed in. A password on an address that was already verified is kept.
 
 ### Signup
 
@@ -171,10 +199,14 @@ unknown address does depends on `open_signup`:
 - `true`: an unknown address is registered, with an organization and workspace of
   its own. Use it where the deployment serves many tenants.
 
+Signup never sets a password on an address that is already verified. That is the
+state a Google or GitHub sign-in leaves, and the person who signs in that way
+adds a password from Account settings while signed in.
+
 Either way the response says the same thing whether the address was unknown,
-already claimed, or genuinely just claimed, so its body discloses nothing about
-the address. Response *timing* still does, because the eligible path sends mail
-before it answers; that is [otari#720](https://github.com/mozilla-ai/otari/issues/720)
+already claimed, already verified, or genuinely just claimed, so its body
+discloses nothing about the address. Response *timing* still does, because the
+eligible path sends mail before it answers; that is [otari#720](https://github.com/mozilla-ai/otari/issues/720)
 and it applies to both postures.
 
 Signup needs mail configured, because an account that cannot verify its address
@@ -188,11 +220,28 @@ whatever edge controls the deployment has.
 ## Invitations
 
 An owner or admin can invite a person to an organization and selected workspaces.
-If mail is configured, Otari sends the accept link. Otherwise the API and
-dashboard expose the link for manual delivery.
+The dashboard always shows the accept link after an invite, so it can be shared
+by hand. If mail is configured, Otari also emails it.
 
-Invitation tokens are bearer credentials. Do not put them in logs or analytics.
-The browser validates and accepts them through the public invitation endpoints.
+To invite several people at once, paste their addresses into the invite dialog,
+separated by commas or new lines (up to 100). Everyone gets the same role and
+workspaces. Each address is invited or refused on its own, so one that is already
+a member does not stop the rest, and the result lists every address with whether
+its email went out, or its accept link to share when it did not.
+
+Opening the link lets the invitee accept. If the invited address has never signed
+in, the accept page asks them to choose a first password, and once they accept
+they can sign in straight away. No verification email is needed, so this works on
+a deployment without mail. An address that can already sign in, by password or
+through a provider, just accepts; the link cannot set or replace a password on
+it.
+
+Invitation tokens are bearer credentials. Whoever holds an unused link can join
+as the invited address, and choose its first password if it has never signed
+in, so send it only to that person.
+Do not put tokens in logs or analytics. The browser validates and accepts them
+through the public invitation endpoints. A link works once, and expires after
+`invitation_expiry_hours`.
 
 A signed-in person also sees the invitations addressed to them, and accepts or
 declines one without a token: they are already authenticated as the addressee,

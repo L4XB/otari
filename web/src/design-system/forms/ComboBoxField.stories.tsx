@@ -74,7 +74,7 @@ export const WithDescription: Story = {
   args: {
     value: "openai:gpt-4o",
     description: "Requests naming this model are routed to it directly.",
-    reserveMessage: true,
+    shouldReserveMessage: true,
   },
 }
 
@@ -114,7 +114,7 @@ export const Invalid: Story = {
     isRequired: true,
     isInvalid: true,
     errorMessage: "Name a model before saving.",
-    reserveMessage: true,
+    shouldReserveMessage: true,
   },
 }
 
@@ -159,4 +159,31 @@ export const PickFromList: Story = {
     emptyMessage: "No models discovered yet. Add a provider credential.",
     noMatchesMessage: "No model matches. Type a selector to use it anyway.",
   },
+}
+
+/**
+ * `describedBy` for a field in a control row whose message is a sentence.
+ *
+ * A message long enough to wrap makes its field taller than the siblings it
+ * shares an `items-end` row with, which lifts that field's input line clear of
+ * theirs (forms.md, "Control rows"), so the caller renders it under the whole
+ * row instead. Text outside a field never reaches its description slot, so this
+ * is what keeps the sentence announced with the input it is about.
+ */
+export const DescribedFromOutsideTheField: Story = {
+  args: {
+    value: "openai:gpt-4o",
+    describedBy: "catalog-hint",
+  },
+  render: (args) => (
+    <div className="flex flex-col gap-1">
+      <div className="flex flex-wrap items-end gap-3">
+        <ComboBoxField {...args} />
+      </div>
+      <span id="catalog-hint" className="text-caption">
+        Could not list models for anthropic. Check that provider's credentials,
+        or type the model key directly.
+      </span>
+    </div>
+  ),
 }

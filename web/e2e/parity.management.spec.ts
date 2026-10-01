@@ -1,7 +1,9 @@
 import { expect, type Locator, type Page, test } from "@playwright/test"
 
 import {
+  API_KEY_PREFIX,
   dismissComboBoxInDialog,
+  expectedKeyFingerprint,
   gotoRoute,
   login,
   nav,
@@ -33,7 +35,7 @@ async function openPage(
   link: string,
   heading: string,
 ): Promise<void> {
-  await nav(page).getByRole("link", { name: link }).click()
+  await nav(page).getByRole("link", { name: link, exact: true }).click()
   await expect(
     page.getByRole("heading", { name: heading, exact: true }),
   ).toBeVisible()
@@ -75,7 +77,8 @@ test.describe("standalone provider setup", () => {
     page,
   }) => {
     await login(page)
-    await openPage(page, "Providers", "Providers")
+    await openOrganization(page)
+    await openPage(page, "Deployment providers", "Deployment providers")
 
     await page.getByRole("button", { name: "Add provider" }).click()
     // Scoped: the heading's trigger and the dialog's submit both say "Add
@@ -173,6 +176,26 @@ test.describe("api keys", () => {
     const reveal = page.getByRole("alert", { name: /API key created/ })
     await expect(reveal).toBeVisible()
     await expect(reveal).toContainText("shown only once")
+    const secretField = reveal.getByLabel("Secret key", { exact: true })
+    await expect(secretField).toHaveValue(
+      new RegExp(`^${API_KEY_PREFIX}.{7}•{8}.{4}$`),
+    )
+    const masked = await secretField.inputValue()
+    await reveal.getByRole("button", { name: "Show Secret key" }).click()
+    const secret = await secretField.inputValue()
+    expect(secret).not.toContain("•")
+    // The shape assertion above is all the concealed field can be held to
+    // before the secret is known; now that it is, the stand-in is pinned to the
+    // fingerprint of this key rather than of any key.
+    expect(masked).toBe(expectedKeyFingerprint(secret))
+    await expect(reveal.getByLabel("curl", { exact: true })).toHaveValue(
+      new RegExp(secret),
+    )
+    await reveal.getByRole("button", { name: "Hide Secret key" }).click()
+    await expect(secretField).toHaveValue(masked)
+    await expect(reveal.getByLabel("curl", { exact: true })).not.toHaveValue(
+      new RegExp(secret),
+    )
     // Scoped to the dialog rather than to the reveal: the acknowledgement is
     // the dialog's own submit, in the footer, so it sits outside the alert
     // region the announcement covers.
@@ -183,13 +206,17 @@ test.describe("api keys", () => {
     await expect(key).toContainText(PARITY.users.heavy)
     // Permanent delete is withheld while a key is live, so a caller in production
     // cannot be broken (and its audit trail erased) in a single click.
-    await expect(key.getByRole("button", { name: "Delete" })).toHaveCount(0)
+    await key.getByRole("button", { name: /^Actions for / }).click()
+    await expect(page.getByRole("menuitem", { name: /^Delete/ })).toBeDisabled()
+    await page.keyboard.press("Escape")
 
-    await key.getByRole("button", { name: "Disable" }).click()
+    await key.getByRole("button", { name: /^Actions for / }).click()
+    await page.getByRole("menuitem", { name: /^Disable/ }).click()
     await expect(key).toContainText("Disabled")
-    await expect(key.getByRole("button", { name: "Enable" })).toBeVisible()
+    await key.getByRole("button", { name: /^Actions for / }).click()
+    await expect(page.getByRole("menuitem", { name: /^Enable/ })).toBeVisible()
 
-    await key.getByRole("button", { name: "Delete" }).click()
+    await page.getByRole("menuitem", { name: /^Delete/ }).click()
     // Scoped to the dialog rather than to `key`: the confirmation is a modal
     // now, outside the table entirely.
     const confirmKey = page.getByRole("alertdialog")

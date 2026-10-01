@@ -7,12 +7,25 @@ Before changing the backend, read
 [backend-standards](../../.github/skills/backend-standards/SKILL.md). The root
 [AGENTS.md](../../AGENTS.md) owns runtime modes, validation, and generated
 artifacts. [ARCHITECTURE.md](../../ARCHITECTURE.md) owns the extension boundary.
+[The modular monolith](../../ARCHITECTURE.md#the-modular-monolith) names the
+target shape and its import rules,
+[Layering](../../.github/skills/backend-standards/SKILL.md#layering) gives the
+rules for each layer, and [docs/domains.md](../../docs/domains.md) says what each
+domain owns.
 
 ## Ports and composition
 
 Domain protocols live in `ports/`, core implementations in `adapters/`, and
 bindings in `container.py`. `OTARI_BOOTSTRAP=module:callable` may rebind a port
 or contribute a capability-gated router after core bindings are installed.
+Which mechanism new code uses is in
+[Where new code goes](../../ARCHITECTURE.md#where-new-code-goes), and the steps
+for an optional feature are in
+[How to add a core feature](../../ARCHITECTURE.md#how-to-add-a-core-feature).
+
+A route module that backs a dashboard page declares `SURFACE` beside its router
+and adds it to `_DECLARED_SURFACES` in `api/routes/bootstrap.py`. A core feature
+sets `surface` on its registry entry instead.
 
 Add a port only when a real second implementation exists. Core never imports an
 overlay. Dependencies request protocols from the container and never name an
@@ -75,7 +88,13 @@ dashboard session. It does not prove that the session may act deployment-wide.
 - Tenant routes authenticate, resolve `CurrentIdentity`, and authorize the
   organization or workspace in `services/tenancy/authorization.py`.
 - Data-plane routes use `verify_api_key_or_master_key`, which never accepts a
-  dashboard cookie.
+  dashboard cookie. The Playground's own completion endpoint
+  (`routes/playground.py`) is the one surface that runs a completion from a
+  session, and it is a separate route rather than a relaxation of that one: it
+  resolves the caller's attribution user and proves their workspace membership
+  itself, then hands the pipeline a `SessionPrincipal`
+  (`types/session_principal.py`). Adding a second such route means doing all
+  three, not reusing the type.
 - Non-billable catalog reads use `verify_catalog_reader`.
 
 Tenant lookups include the tenant predicate and return 404 for a foreign ID.
@@ -113,12 +132,12 @@ hold and settle all three: a limit added to `budgets` needs a counter and a hold
 on `users` and on `scoped_budgets`, or it binds through one reachability and is
 silently ignored through the other.
 
-`budget_service.reserve_budget` places the estimate before dispatch and the
+`reserve_budget` in `services/budgets/` places the estimate before dispatch and the
 shared settlement helpers reconcile or refund it. Scoped reservations use
 conditional updates in one total order and compensate earlier holds when a
 later ceiling refuses.
 
-`budget_reservation_ledger.py` gives each request's holds one identity.
+`services/budgets/_ledger.py` gives each request's holds one identity.
 Settlement claims that row before changing counters, making duplicate release a
 no-op. Write the ledger after the holds it records; a top-up grows the existing
 row rather than creating a second independently expiring hold.
@@ -136,14 +155,27 @@ router backends outside it so CLI and API explain can compile without I/O.
 Asynchronous router decisions live under `services/routing/` and pass a
 `RouterOrdering` into the compiler. A declined decision uses the policy
 default. The API attempt walker executes the compiled order and owns fallback
-settlement.
+settlement. Work that depends on the account a candidate's credential reaches
+runs in its `prepare_kwargs` step, once per candidate, and a candidate that step
+cannot serve is skipped without reordering the plan (`CandidateCannotServe`).
 
 ## Tools, MCP, and guardrails
 
-Only `otari_*` tool types run in the gateway; other declarations pass through
-to the provider. The tool loop is in `services/mcp_loop.py`, sandbox and search
-backends under `services/`, and outbound URL checks in
-`services/url_safety.py`.
+An `otari_*` tool type always runs in the gateway. Who runs a provider-native
+web-search type is described in
+[web-search interception](../../docs/tools.md#web-search-interception) and
+decided by `claims_provider_web_search` in `api/routes/_tools.py`. A provider-native
+code-execution type is decided by the executor (`models/tools.py`,
+resolved in `api/routes/_tools.py`): a workspace pin wins over everything, the
+`Otari-Code-Execution` header wins over the deployment default, and `auto`
+claims a declaration only when the dispatched provider does not run it
+natively. The workspace policy is read once, in the request preamble, and
+reused at admission; the same decision says where a referenced upload goes,
+staged for the gateway's sandbox or copied, for each candidate as it is
+dispatched, into the provider account whose container will read it
+(`FileService.provider_file_ids`). The tool loop is in
+`services/mcp_loop.py`, sandbox and search backends under `services/`, and
+outbound URL checks in `services/url_safety.py`.
 
 Deployment settings establish available backends. Workspace code-execution and
 web-search policy can disable or narrow those settings but cannot widen them.
@@ -189,7 +221,10 @@ and use the shared renderer and header sanitization.
 ## Activation guide
 
 `workspace_activation_service.py` derives activation from the first successful
-usage row served by this deployment. Imported and absorbed rows do not count.
+usage row served by this deployment. Imported and absorbed rows do not count,
+and neither does a Playground row: the guide marks somebody integrating Otari
+from their own code, so it filters on the endpoint label as well as the source
+(`core/usage_source.integration_traffic`).
 The activation-state table stores only dismissal and setup-key state.
 
 Key issuance requires workspace management authority and rotates the existing
@@ -198,17 +233,27 @@ endpoints.
 
 ## Data and migrations
 
-Gateway ORM entities live in `models/entities.py`. Reconciled control-plane
-SQLModel tables live in `models/tenancy.py`. Both share `SQLModel.metadata`;
-`models/__init__.py` imports every table module before Alembic uses it.
+Put a table in its domain's model module (`models/budgets.py`,
+`models/tenancy.py`, and so on). `models/base.py` holds `Base` and the shared
+column types and mixins. Tables use the declarative `Base`, except those whose
+`Public` schemas are endpoint contracts, which use SQLModel (`models/tenancy.py`,
+`models/provider_keys.py`, `models/playground.py`). A new table module must join
+the import list in `models/__init__.py`, or Alembic proposes dropping its tables.
+
+Two classes are named `User`: `models/users.py` is the billing identity that
+keys, budgets, and usage attach to; `models/tenancy.py` is the dashboard sign-in
+identity.
 
 Request code gets a session through `get_db`; non-request code uses
 `create_session()`; the usage-log writer uses `create_log_session()`, which
 draws from a pool of its own so metering is not starved by request traffic.
-Services own commits and rollbacks. The one exception is
-`release_session(db)`, which the request path calls before dispatching upstream
-so a pooled connection is not held across the provider call. Migrations live
-under `alembic/versions/`.
+Code still in the old shape commits in its services, and the request path
+calls `release_session(db)` before dispatching upstream so a pooled connection
+is not held across the provider call. New code commits through a Unit of Work
+block, as
+[Who commits](../../.github/skills/backend-standards/SKILL.md#who-commits)
+describes.
+Migrations live under `alembic/versions/`.
 
 Once a client-side `db_command_timeout` is configured, a database call can
 raise a bare `TimeoutError` as well as a `SQLAlchemyError`. Statement timeouts
@@ -223,8 +268,15 @@ not, so handlers on the request path catch `DATABASE_ERRORS` from
 supports `${VAR}` interpolation. Service-level environment reads go through
 `otari_env()`.
 
-Validate a new security or routing setting at config load. Add it to the
-Settings visibility roster or deliberate-omission list.
+Validate a new security or routing setting at config load. Annotate every new
+field with its settings view (`core/settings_view.py`): shown in a group,
+omitted, or secret. The settings endpoint derives its view from that, and a
+field without one fails at import.
+
+A domain's settings live in `core/settings/<domain>.py`. `GatewayConfig`
+inherits them rather than nesting them, because a nested model does not read
+a flat `OTARI_<FIELD>` variable. A new setting goes in its domain's module
+where one exists.
 
 ## Usage filters
 
@@ -242,6 +294,21 @@ One exception to the shared semantics: `GET /api/v1/usage/count` narrows
 rather than a page. A count that sizes a mutation applies the mutation's fixed
 scope and not only its filter set. Nothing else narrows it, and
 `UsageEntry.bulk_editable` is how a client learns which rows that scope admits.
+
+## Agent Guardrails
+
+`otari_agent.domain` (in the `otari-agent` workspace member, `cli/`) evaluates
+a caller-submitted `.otari-guardrails.yml` policy against caller-submitted evidence.
+Everything under it is pure: no filesystem, network, subprocess, or clock
+access. Otari never reads a caller's repository itself. It lives beside the CLI
+rather than in the gateway so `otari hook` installs without the server;
+`routes/hooks.py` imports it from there. `otari_agent.domain.check`'s
+`run_policy_check` is the shared orchestration (parse, budget-guard,
+dispatch to each gate's evaluator): `otari hook` (`cli.py`) calls it in
+process by default, needing no running gateway, and the Hook Server
+(`POST /api/v1/hooks/check`, `routes/hooks.py`) calls the same function for
+whoever opts a hook into checking against a gateway over HTTP instead. See
+[docs/agent-guardrails.md](../../docs/agent-guardrails.md).
 
 ## Logging
 

@@ -15,6 +15,7 @@ from gateway.core.usage import (
     cache_tokens_in_prompt_of,
     cache_write_1h_tokens_of,
     cache_write_tokens_of,
+    reasoning_tokens_of,
 )
 from gateway.log_config import logger
 from gateway.model_labeling import relabel_model
@@ -106,6 +107,7 @@ def _merge_usage(current: CompletionUsage, update: CompletionUsage) -> Completio
         # (Anthropic) if any chunk reported it that way, so the seed's default of
         # "in prompt" never masks the Anthropic shape.
         cache_tokens_in_prompt=cache_tokens_in_prompt_of(update) and cache_tokens_in_prompt_of(current),
+        reasoning_tokens=reasoning_tokens_of(update) or reasoning_tokens_of(current),
     )
 
 
@@ -164,6 +166,7 @@ async def streaming_generator(
     settle_before_done: bool = False,
     is_cost_carrier: Callable[[Any], bool] | None = None,
     attach_settlement: Callable[[Any, S], bool] | None = None,
+    on_first_chunk: Callable[[], None] | None = None,
 ) -> AsyncGenerator[str, None]:
     """Shared SSE streaming generator with usage tracking and error handling.
 
@@ -195,14 +198,19 @@ async def streaming_generator(
             before emitting it. Standalone callers leave this false.
         is_cost_carrier: Identifies a provider object that can carry cost. The last
             match in the stream wins, so a predicate that also matches a non-terminal
-            object (a chat tool loop forwards one usage chunk per iteration) costs no
-            buffering beyond the chunks between that match and the next one.
+            object costs no buffering beyond the chunks between that match and the
+            next one.
         attach_settlement: Mutates that carrier with the opaque settlement value.
+        on_first_chunk: Called synchronously, at most once, the moment the first
+            non-keepalive chunk is about to be formatted and yielded. Lets the
+            caller record time-to-first-token without this generator knowing
+            anything about how that timing gets used or persisted.
 
     """
     usage = CompletionUsage(prompt_tokens=0, completion_tokens=0, total_tokens=0)
     has_usage = False
     settled = False
+    seen_first_chunk = False
     terminal_buffer: list[Any] = []
     cost_carrier: Any | None = None
     buffering_terminal = False
@@ -216,6 +224,20 @@ async def streaming_generator(
             chunk = relabel_model(chunk, display_model)
         return format_chunk(chunk)
 
+    def _format_and_mark_first(chunk: Any) -> str:
+        # Format before marking: on_first_chunk must fire only once a chunk
+        # has actually been turned into something we are about to yield, not
+        # when it was merely pulled off the upstream. This also covers a
+        # chunk that reaches the client via the terminal buffer rather than
+        # the immediate yield below.
+        nonlocal seen_first_chunk
+        formatted = _format(chunk)
+        if not seen_first_chunk:
+            seen_first_chunk = True
+            if on_first_chunk is not None:
+                on_first_chunk()
+        return formatted
+
     try:
         async with aclosing(_chunks_or_keepalive(stream, keepalive_interval)) as source:
             async for chunk in source:
@@ -228,14 +250,12 @@ async def streaming_generator(
                     has_usage = True
 
                 if settle_before_done and is_cost_carrier is not None and is_cost_carrier(chunk):
-                    # A later carrier supersedes an earlier one. A chat tool loop
-                    # forwards one ``include_usage`` chunk per iteration, so the
-                    # first one is not terminal; flushing here keeps the next
-                    # iteration's answer streaming instead of holding it behind a
-                    # carrier that is not the last, and leaves cost on the chunk
-                    # that really ends the stream.
+                    # A later carrier supersedes an earlier one: flushing here keeps
+                    # the stream flowing instead of holding it behind a carrier that
+                    # is not the last, and leaves cost on the chunk that really ends
+                    # the stream.
                     for buffered_chunk in terminal_buffer:
-                        yield _format(buffered_chunk)
+                        yield _format_and_mark_first(buffered_chunk)
                     terminal_buffer.clear()
                     cost_carrier = chunk
                     terminal_buffer.append(chunk)
@@ -254,16 +274,16 @@ async def streaming_generator(
                             )
                             overflow_logged = True
                         for buffered_chunk in terminal_buffer:
-                            yield _format(buffered_chunk)
+                            yield _format_and_mark_first(buffered_chunk)
                         terminal_buffer.clear()
                         cost_carrier = None
                         buffering_terminal = False
-                        yield _format(chunk)
+                        yield _format_and_mark_first(chunk)
                         continue
                     terminal_buffer.append(chunk)
                     continue
 
-                yield _format(chunk)
+                yield _format_and_mark_first(chunk)
 
         # Once the upstream is exhausted, hybrid mode settles before emitting
         # the buffered terminal suffix. Standalone mode retains the historical
@@ -298,7 +318,7 @@ async def streaming_generator(
                 except Exception as attach_err:
                     logger.error("Failed to attach streaming settlement for %s: %s", label, attach_err)
             for buffered_chunk in terminal_buffer:
-                yield _format(buffered_chunk)
+                yield _format_and_mark_first(buffered_chunk)
             terminal_buffer.clear()
             yield fmt.done_marker
         else:
@@ -328,7 +348,7 @@ async def streaming_generator(
         # A carrier may have been buffered just before the upstream failed. It
         # remains an ordinary provider event and must precede the safe error.
         for buffered_chunk in terminal_buffer:
-            yield _format(buffered_chunk)
+            yield _format_and_mark_first(buffered_chunk)
         terminal_buffer.clear()
         yield fmt.error_payload
         if fmt.yield_done_on_error:

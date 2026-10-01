@@ -21,8 +21,6 @@ import {
   useDeleteOrganizationAlias,
   useDeleteOrganizationRoutingPolicy,
   useDeleteRoutingPolicy,
-  useOrganizationAliases,
-  useOrganizationRoutingPolicies,
   useRoutingPolicies,
 } from "@/shared/api/routing"
 import { useUrlValue } from "@/shared/helpers/urlState"
@@ -30,15 +28,15 @@ import { useSelectedWorkspace } from "@/shared/hooks/SelectedWorkspace"
 
 import { PolicyForm } from "./PolicyForm"
 import {
-  candidatesOf,
-  defaultTargetOf,
+  computeShares,
+  findCandidates,
+  findFallthroughTarget,
+  findRouterBackend,
+  findWeights,
   KNN_BACKEND,
-  normalizedBackend,
+  normalizeBackend,
   type RoutingRow,
-  routerBackendOf,
-  sharesOf,
   WEIGHTED_BACKEND,
-  weightsOf,
 } from "./policyModel"
 
 /** Present an alias as the one-target policy it is. */
@@ -101,7 +99,7 @@ function isEditableInForm(spec: PolicySpec): boolean {
     // controls would silently rewrite it as a backend the operator did not choose.
     if (entry.router !== undefined) {
       if ((entry.candidates?.length ?? 0) === 0) return false
-      const backend = normalizedBackend(entry.router)
+      const backend = normalizeBackend(entry.router)
       if (backend === KNN_BACKEND) return true
       // A weighted entry without weights cannot be saved back (the API refuses it),
       // so the form would have to invent a split. Read-only says so instead.
@@ -129,7 +127,7 @@ function isEditableInForm(spec: PolicySpec): boolean {
  *  a guess about a backend added after this line was written.
  */
 function routerLabelOf(spec: PolicySpec): string {
-  const backend = routerBackendOf(spec)
+  const backend = findRouterBackend(spec)
   if (backend === WEIGHTED_BACKEND) return "Weighted"
   if (backend === KNN_BACKEND) return "Learned"
   return "Routed"
@@ -138,27 +136,27 @@ function routerLabelOf(spec: PolicySpec): string {
 /** One line summarising what a policy serves, for the table. */
 function servesSummary(policy: RoutingPolicyResponse): string {
   const chain = policy.spec.on_failure ?? []
-  const pool = candidatesOf(policy.spec)
-  if (pool.length > 0 && routerBackendOf(policy.spec) === WEIGHTED_BACKEND) {
+  const pool = findCandidates(policy.spec)
+  if (pool.length > 0 && findRouterBackend(policy.spec) === WEIGHTED_BACKEND) {
     // The split shape, not the model names: two provider:model strings do not fit a
     // table cell, and the shares are what distinguishes one weighted policy from
     // another. The pool is spelled out in the editor and in explain.
-    const declared = weightsOf(policy.spec)
-    const target = defaultTargetOf(policy.spec)
+    const declared = findWeights(policy.spec)
+    const target = findFallthroughTarget(policy.spec)
     const full = pool.includes(target) ? pool : [...pool, target]
-    const split = sharesOf(full.map((selector) => declared[selector] ?? 0))
+    const split = computeShares(full.map((selector) => declared[selector] ?? 0))
       .map((share) => `${Math.round(share)}%`)
       .join(" / ")
     return `Weighted · ${split} across ${full.length} models`
   }
   if (pool.length > 0) {
-    return `${routerLabelOf(policy.spec)} · ${pool.length} candidates, ${defaultTargetOf(policy.spec)} by default`
+    return `${routerLabelOf(policy.spec)} · ${pool.length} candidates, ${findFallthroughTarget(policy.spec)} by default`
   }
   if (policy.is_dynamic) {
     const total = 1 + chain.length
     return `Chosen per request · ${total} candidate${total === 1 ? "" : "s"}`
   }
-  const target = defaultTargetOf(policy.spec)
+  const target = findFallthroughTarget(policy.spec)
   return chain.length > 0 ? `${target}  +${chain.length} on failure` : target
 }
 
@@ -181,49 +179,44 @@ function KindMark({ label }: { label: string }) {
 }
 
 export function RoutingPage() {
-  // Deliberately unscoped, unlike keys and usage. The gateway stores every
-  // policy and alias in the default workspace on purpose, because resolution
-  // reads a process-wide name-keyed cache: one stored elsewhere would be listed
-  // as scoped while it resolved for everyone. Filtering this list by the
-  // selected workspace would therefore show an empty page while those policies
-  // were live for that workspace's traffic, and hide a policy the moment it was
-  // created. Scope this when resolution is scoped, not before.
+  // Scoped to the selected workspace, like keys and usage (otari-ai#2087).
+  // Resolution is workspace-keyed (`services/policy_store`), so a stored policy
+  // decides the traffic of one workspace and belongs on that workspace's page.
+  // Left unscoped, the deployment-wide list showed an operator every tenant's
+  // rows and an admin every workspace of theirs, neither of which is what the
+  // page claims to be. Config-file entries have no workspace and are listed
+  // whatever the selection, being in force in all of them.
   //
-  // Which list is asked depends on who is signed in (otari-ai#1942): an
-  // operator reads the deployment-wide management view, and anyone else reads
-  // the tenant-scoped `/organizations/me/*` pair. Both reads wait for the
-  // context to settle rather than taking "not yet an operator" as "member", so
-  // an operator's page does not fire a read it is about to drop.
+  // Which of the two surfaces answers depends on who is signed in
+  // (otari-ai#1942, otari-ai#1969), and `useRoutingScope` makes that choice once
+  // for both lists: an operator reads the deployment-wide pair, anyone else the
+  // tenant-scoped `/organizations/me/*` one. Both wait for the context to settle
+  // rather than taking "not yet an operator" as "member".
   const organization = useOrganizationContext()
   const isOperator = isDeploymentOperator(organization.data)
   const isContextSettled =
     organization.data !== undefined || organization.isError
-  const policies = useRoutingPolicies(isOperator)
-  const memberPolicies = useOrganizationRoutingPolicies(
-    isContextSettled && !isOperator,
-  )
-  const aliases = useAliases(isOperator)
-  const memberAliases = useOrganizationAliases(isContextSettled && !isOperator)
+  // The switcher is seeded from the caller's own memberships, not the
+  // organization's whole list (otari-ai#1969), so this is null only for somebody
+  // who belongs to no workspace: they have nothing of their own to see and
+  // nowhere to write, and are shown the config entries on a read-only page.
+  const { selected: selectedWorkspace } = useSelectedWorkspace()
+  const workspaceId = selectedWorkspace?.workspace_id
+  const policies = useRoutingPolicies(workspaceId)
+  const aliases = useAliases(workspaceId)
   const deletePolicy = useDeleteRoutingPolicy()
   const deleteAlias = useDeleteAlias()
   const deleteOrgPolicy = useDeleteOrganizationRoutingPolicy()
   const deleteOrgAlias = useDeleteOrganizationAlias()
-  // Where a tenant admin's write lands, and null for an operator, who writes
-  // deployment-wide. The tenant surface requires the workspace named, so an
-  // admin who belongs to none has nowhere to write and is shown the read-only
-  // page: the switcher is seeded from their own memberships, not the
-  // organization's whole list (otari-ai#1969).
-  const { selected: selectedWorkspace } = useSelectedWorkspace()
-  const writeWorkspaceId = isOperator
-    ? null
-    : (selectedWorkspace?.workspace_id ?? null)
+  // Where a create lands, on either surface. An operator's used to omit it and
+  // land in the deployment's default workspace, which is a row saved from one
+  // workspace's page and listed on another's. A write to an existing row uses
+  // that row's own workspace instead (`deleteWorkspaceFor` below, and the Edit
+  // form's `workspaceId`), so a list still being refetched through a switch
+  // cannot move a row between workspaces.
+  const writeWorkspaceId = workspaceId ?? null
   const canEdit =
     isOperator || (canManage(organization.data) && writeWorkspaceId !== null)
-  // An admin's list spans every workspace of the organization, not just the
-  // selected one, so a write to an existing row goes back to the workspace that
-  // row lives in (`rowWorkspace` below, and the Edit form's `workspaceId`).
-  // Using the selection would create a second policy of the same name in the
-  // selected workspace and leave the edited one untouched.
   // A deep link may pre-fill the add form with ?target=provider:model.
   const initialTarget = useUrlValue("target")
   const [adding, setAdding] = useState(initialTarget !== "")
@@ -236,17 +229,17 @@ export function RoutingPage() {
   const createButtonRef = useRef<HTMLButtonElement | null>(null)
   const [createCount, setCreateCount] = useState(0)
   const openCreate = () => {
-    setEditing(null)
+    setEditing(undefined)
     setCreateCount((n) => n + 1)
     setAdding(true)
   }
   const closeCreate = () => setAdding(false)
-  const [editing, setEditing] = useState<RoutingRow | null>(null)
+  const [editing, setEditing] = useState<RoutingRow>()
   const [pendingDelete, setPendingDelete] = useState<RoutingRow>()
   // Readiness opens inline under its own row (DataTable's accordion), because it
   // describes one policy and the operator clicked that policy. A card above the
   // table would put the panel nowhere near the control that opened it.
-  const [expanded, setExpanded] = useState<string | null>(null)
+  const [expanded, setExpanded] = useState<string>()
   // `adding` is seeded from ?target= before the membership context settles, so
   // the role is applied here rather than in the initializer: gating the
   // initializer would drop an operator's deep link, since `isOperator` is still
@@ -256,20 +249,12 @@ export function RoutingPage() {
 
   // Aliases and policies are listed together: an alias is the one-target case,
   // and this page is the only place either is managed.
-  //
-  // Both operator lists are read through `isOperator` rather than relied on to
-  // be empty because their hooks are disabled: a disabled query still hands
-  // back whatever sits in the cache under its key, so a caller who was an
-  // operator earlier in the session would keep seeing the deployment-wide rows
-  // after being demoted. The gate belongs where the data is rendered.
   const rows: RoutingRow[] = [
-    ...((isOperator ? policies.data : memberPolicies.data) ?? []).map(
-      (policy) => ({
-        ...policy,
-        kind: "policy" as const,
-      }),
-    ),
-    ...((isOperator ? aliases.data : memberAliases.data) ?? []).map(aliasAsRow),
+    ...(policies.data ?? []).map((policy) => ({
+      ...policy,
+      kind: "policy" as const,
+    })),
+    ...(aliases.data ?? []).map(aliasAsRow),
   ].sort(
     (a, b) =>
       a.name.localeCompare(b.name) ||
@@ -278,21 +263,18 @@ export function RoutingPage() {
   // The context counts as loading too: until it settles, neither list has been
   // asked, and an empty table would read as "no policies" rather than "not yet".
   const isListLoading =
-    !isContextSettled ||
-    (isOperator
-      ? policies.isLoading || aliases.isLoading
-      : memberPolicies.isLoading || memberAliases.isLoading)
+    !isContextSettled || policies.isLoading || aliases.isLoading
 
   // Stable so DataTable's row cache holds; see its docstring.
   const renderDetail = useCallback(
     (row: RoutingRow) => (
       <RouterReadiness
         policyName={row.name}
-        candidates={candidatesOf(row.spec)}
-        defaultTarget={defaultTargetOf(row.spec)}
-        backend={routerBackendOf(row.spec) ?? KNN_BACKEND}
+        candidates={findCandidates(row.spec)}
+        defaultTarget={findFallthroughTarget(row.spec)}
+        backend={findRouterBackend(row.spec) ?? KNN_BACKEND}
         scopedUserId={row.user_id ?? null}
-        onClose={() => setExpanded(null)}
+        onClose={() => setExpanded(undefined)}
       />
     ),
     [],
@@ -319,7 +301,7 @@ export function RoutingPage() {
             {/* The kind of routing, as an affirmative mark: a fallback chain or
                 a learned router is a decision somebody made about this policy,
                 where a plain single-target policy is just the default shape. */}
-            {candidatesOf(policy.spec).length > 0 ? (
+            {findCandidates(policy.spec).length > 0 ? (
               <KindMark label={routerLabelOf(policy.spec)} />
             ) : policy.is_dynamic ? (
               <KindMark label="Dynamic" />
@@ -395,8 +377,9 @@ export function RoutingPage() {
         // empty cell, since a fallback chain has nothing to learn and that
         // absence is worth stating and is not the same as zero examples. Then
         // the control, for a backend that learns.
-        const readiness = !isOperator ? null : routerBackendOf(policy.spec) !==
-          KNN_BACKEND ? (
+        const readiness = !isOperator ? null : findRouterBackend(
+            policy.spec,
+          ) !== KNN_BACKEND ? (
           <span className="text-muted">—</span>
         ) : (
           <RowAction
@@ -404,7 +387,7 @@ export function RoutingPage() {
             label={expanded === rowKeyOf(policy) ? "Hide examples" : "Examples"}
             onPress={() =>
               setExpanded((current) =>
-                current === rowKeyOf(policy) ? null : rowKeyOf(policy),
+                current === rowKeyOf(policy) ? undefined : rowKeyOf(policy),
               )
             }
           />
@@ -449,19 +432,19 @@ export function RoutingPage() {
     return base
   }, [canEdit, expanded, isOperator])
 
-  // Which of the four delete surfaces a row goes to. The tenant one names the
-  // workspace and has no user scope; the deployment-wide one defaults the
-  // workspace and keeps it.
+  // Which of the four delete surfaces a row goes to. Both name the workspace the
+  // row lives in; only the deployment-wide pair carries the user scope, which
+  // the tenant surface has no rows in.
   const deleteWorkspaceFor = (row: RoutingRow) =>
-    isOperator ? null : (row.workspace_id ?? writeWorkspaceId)
+    row.workspace_id ?? writeWorkspaceId
   const deleteMutationFor = (row: RoutingRow) =>
-    deleteWorkspaceFor(row) !== null
+    isOperator
       ? row.kind === "alias"
-        ? deleteOrgAlias
-        : deleteOrgPolicy
-      : row.kind === "alias"
         ? deleteAlias
         : deletePolicy
+      : row.kind === "alias"
+        ? deleteOrgAlias
+        : deleteOrgPolicy
   // Resolved for the pending row alone, not as a chain over all four: a refusal
   // stays on its mutation until the next call, so reading every one of them
   // would report the last row's failure over this row's confirm.
@@ -501,14 +484,7 @@ export function RoutingPage() {
 
       {/* The reads only. Every delete on this page reports inside its own
           confirm dialog, which is where the operator is looking. */}
-      <ErrorBanner
-        error={
-          policies.error ??
-          memberPolicies.error ??
-          aliases.error ??
-          memberAliases.error
-        }
-      />
+      <ErrorBanner error={policies.error ?? aliases.error} />
 
       {/* Mounted while closed so the frame plays its exit with the content
           intact, and keyed on the open counter so the draft is fresh on the way
@@ -523,20 +499,20 @@ export function RoutingPage() {
         // the frame's own restore has nothing to land on. The heading's action
         // survives.
         returnFocusRef={createButtonRef}
+        isDeploymentWide={isOperator}
         workspaceId={writeWorkspaceId}
         onClose={closeCreate}
       />
-      {editing !== null ? (
+      {editing !== undefined ? (
         <PolicyForm
           // Keyed on the row: the fields seed from `existing` once, through
           // mount-only state, so without this a second row's Edit would open
           // with the first row's draft and save it under the second one's name.
           key={rowKeyOf(editing)}
           existing={editing}
-          workspaceId={
-            isOperator ? null : (editing.workspace_id ?? writeWorkspaceId)
-          }
-          onClose={() => setEditing(null)}
+          isDeploymentWide={isOperator}
+          workspaceId={editing.workspace_id ?? writeWorkspaceId}
+          onClose={() => setEditing(undefined)}
         />
       ) : null}
 
@@ -619,23 +595,25 @@ export function RoutingPage() {
           if (!pendingDelete) return
           const onSuccess = () => setPendingDelete(undefined)
           const rowWorkspace = deleteWorkspaceFor(pendingDelete)
-          if (rowWorkspace !== null) {
-            const scoped = {
+          if (isOperator) {
+            const deployment = {
               name: pendingDelete.name,
+              userId: pendingDelete.user_id,
               workspaceId: rowWorkspace,
             }
             if (pendingDelete.kind === "alias")
-              deleteOrgAlias.mutate(scoped, { onSuccess })
-            else deleteOrgPolicy.mutate(scoped, { onSuccess })
+              deleteAlias.mutate(deployment, { onSuccess })
+            else deletePolicy.mutate(deployment, { onSuccess })
             return
           }
-          const deployment = {
-            name: pendingDelete.name,
-            userId: pendingDelete.user_id,
-          }
+          // Unreachable: Delete is rendered behind `canEdit`, which for a
+          // tenant admin already requires a selected workspace, and a stored row
+          // always carries its own.
+          if (rowWorkspace === null) return
+          const scoped = { name: pendingDelete.name, workspaceId: rowWorkspace }
           if (pendingDelete.kind === "alias")
-            deleteAlias.mutate(deployment, { onSuccess })
-          else deletePolicy.mutate(deployment, { onSuccess })
+            deleteOrgAlias.mutate(scoped, { onSuccess })
+          else deleteOrgPolicy.mutate(scoped, { onSuccess })
         }}
       />
     </div>

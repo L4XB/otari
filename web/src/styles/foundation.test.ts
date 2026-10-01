@@ -37,16 +37,28 @@ function walk(root: string): string[] {
     }
   }
 }
-const CSS = readFileSync(join(WEB, "src", "styles", "globals.css"), "utf8")
+/**
+ * The foundation as the application loads it, which is two files: `globals.css`
+ * and the design system's own stylesheet, which `globals.css` imports first.
+ * Concatenated in that order so a block present in both resolves the way the
+ * first-match lookup below always has. Which file a rule belongs in is the
+ * subject of `architecture.test.ts`, not of this one.
+ */
+const CSS = [
+  readFileSync(join(WEB, "src", "styles", "globals.css"), "utf8"),
+  readFileSync(join(WEB, "src", "design-system", "design-system.css"), "utf8"),
+].join("\n")
 
 /**
  * The text of one top-level block, from `selector {` to the `}` that closes it
- * in the first column. Every block in globals.css is written that way, so a
+ * in the first column. Every block in either file is written that way, so a
  * brace counter would only add ways to be subtly wrong about a nested at-rule.
  */
 function block(selector: string): string {
   const start = CSS.indexOf(`${selector} {`)
-  expect(start, `no \`${selector} {\` block in globals.css`).toBeGreaterThan(-1)
+  expect(start, `no \`${selector} {\` block in the foundation`).toBeGreaterThan(
+    -1,
+  )
   const end = CSS.indexOf("\n}\n", start)
   expect(end, `\`${selector}\` block is never closed`).toBeGreaterThan(start)
   return CSS.slice(start, end)
@@ -136,6 +148,25 @@ function contrast(a: string, b: string): number {
   return (hi + 0.05) / (lo + 0.05)
 }
 
+/**
+ * The hex behind a one-level alias, for the variables that are declared as
+ * `var(--color-…)` rather than as a color. Deliberately one level and not a
+ * resolver: every alias in these blocks is one hop, and a general one would
+ * quietly keep passing if a chain grew a cycle.
+ */
+function alias1(tokens: Map<string, string>, name: string): string {
+  const value = tokens.get(name)
+  expect(value, `${name} is not declared`).toBeDefined()
+  const target = /^var\((--[a-z0-9-]+)\)$/.exec(value as string)?.[1]
+  if (!target) return value as string
+  const resolved = tokens.get(target)
+  expect(
+    resolved,
+    `${name} aliases ${target}, which is not declared`,
+  ).toBeDefined()
+  return resolved as string
+}
+
 describe("text on every ground it can land on", () => {
   // The repair in this change was measured against all six grounds each theme
   // declares, and the measurement is the assertion. Without it the WCAG AA fix
@@ -184,6 +215,53 @@ describe("text on every ground it can land on", () => {
       }
     }
   })
+})
+
+describe("a placeholder does not read as a typed value", () => {
+  // `@heroui/styles` aliases `--field-placeholder` to `--muted`, and this file's
+  // mapping points `--muted` at the SECONDARY text role, which is tuned to carry
+  // captions at 4.5:1. Inheriting that default put a hint 1.47:1 from a typed
+  // value in the light theme and 1.58:1 in the dark one, so `New policy` looked
+  // like a form somebody had already filled in. The alias to the tertiary rung is
+  // the whole fix, and it is one line in each theme block: easy to drop in a
+  // palette edit, and invisible until somebody opens a dialog and misreads it.
+  //
+  // 3:1 is WCAG's floor for telling two non-text UI elements apart, which is the
+  // job here. It is deliberately not 4.5: the placeholder is meant to look
+  // secondary, and driving it further from the value would push it off the field.
+  const UI_COMPONENT = 3
+
+  it.each([
+    ["light", LIGHT],
+    ["dark", DARK],
+  ] as const)(
+    "is a rung below the value ink in the %s theme",
+    (theme, tokens) => {
+      const alias = tokens.get("--field-placeholder")
+      expect(
+        alias,
+        `--field-placeholder is unmapped in the ${theme} theme, so HeroUI's own \`var(--muted)\` wins`,
+      ).toBeDefined()
+      // A hex here would stop tracking the ramp, the same way the HeroUI mapping
+      // above refuses one.
+      expect(
+        alias,
+        `--field-placeholder bypasses the tokens in the ${theme} theme`,
+      ).toMatch(/^var\(--color-[a-z0-9-]+\)$/)
+
+      // Both sides resolved through the mapping rather than named directly, so
+      // this keeps measuring the two inks a field actually paints with if either
+      // is ever repointed at a different rung.
+      const ratio = contrast(
+        alias1(tokens, "--field-foreground"),
+        alias1(tokens, "--field-placeholder"),
+      )
+      expect(
+        ratio,
+        `a placeholder is ${ratio.toFixed(2)}:1 from a typed value in the ${theme} theme, under the ${UI_COMPONENT}:1 needed to tell them apart`,
+      ).toBeGreaterThanOrEqual(UI_COMPONENT)
+    },
+  )
 })
 
 describe("the type scale's two halves", () => {
@@ -576,7 +654,7 @@ describe("design foundation tokens", () => {
 // Three of those reached this file from scripted edits and were found by
 // somebody reading the lines next to them, which is not a way of finding
 // things.
-it("has no comment opened inside another comment in globals.css", () => {
+it("has no comment opened inside another comment in the foundation", () => {
   const offenders: string[] = []
   let inComment = false
   for (let i = 0; i < CSS.length - 1; i++) {
@@ -640,11 +718,10 @@ describe("a table is a region, not a card", () => {
     "otari-mcp-table",
     "otari-members-table",
     "otari-models-table",
+    "otari-offered-models-table",
     "otari-overview-activity",
-    "otari-pricing-table",
     "otari-provider-keys-table",
     "otari-providers-table",
-    "otari-rate-overrides-table",
     "otari-routing-table",
     "otari-workspaces-table",
   ]
@@ -849,7 +926,7 @@ describe("semantic tokens only", () => {
     // able to name the thing it is explaining.
     expect(
       stripComments(source),
-      "a focus ring is defined once in globals.css; use `otari-focus-ring`, do not spell one here",
+      "a focus ring is defined once; use `otari-focus-ring`, do not spell one here",
     ).not.toMatch(
       /\b(?:ring|outline)-(?:accent|primary|focus)\b|\boutline-offset-\d|\b(?:ring|outline)-[1-9]\b/,
     )
@@ -1061,10 +1138,6 @@ describe("content text wears a type role", () => {
       "a workspace description truncated in a cell, and its budget helper",
     ],
     [
-      "features/models/ModelsPage.tsx",
-      "the selector, the family, and the not-discovered label",
-    ],
-    [
       "features/models/ModelScopeControl.tsx",
       "the blocked-from-every-model state banner",
     ],
@@ -1100,7 +1173,6 @@ describe("content text wears a type role", () => {
       "features/routing/RoutingPage.tsx",
       "the candidate cap, a consequence note in the button row",
     ],
-    ["features/usage/ShareDialog.tsx", "a notice in the dialog's button row"],
   ]
   const RULED = new Map(CAPTION_SIZE_IS_RULED)
 
@@ -1334,6 +1406,9 @@ describe("no font size is written at a call site", () => {
 })
 
 // Touch targets. The rule ("at least 44px on the phone viewport") is in the
+// HIG and is a device measure, so the prose here counts in pixels while the
+// stylesheet spells them in rem: 2.75rem is 44px at the default root size, and
+// larger for a reader who raised it, which is the direction that floor wants.
 // frontend-standards responsiveness guide and was written at ~180 `size="sm"`
 // call sites that do not meet it, so it is enforced as one floor in the
 // stylesheet rather than as a className each of them has to remember.
@@ -1354,19 +1429,19 @@ describe("the phone viewport's touch-target floor", () => {
     // Asserted as a pair: the dense height exists, and it is undone at 767px.
     //
     // Both halves are now a custom property on the PLACE rather than a height
-    // on its descendants, which is why these read `--field-height` (see
-    // globals.css, and Toolbar's docstring, for why a variable and not a
-    // descendant selector). What is being held is the pair, not the spelling:
+    // on its descendants, which is why these read `--field-height` (see the
+    // field-metrics family in globals.css, and Toolbar's docstring, for why a
+    // variable and not a descendant selector). What is being held is the pair, not the spelling:
     // if a rewrite drops the 767px half, a phone gets a 32px search box.
     expect(CSS).toMatch(
-      /\.otari-toolbar,\s*\.otari-pagination,\s*\.otari-settings \{\s*--field-height: 32px;/,
+      /\.otari-toolbar,\s*\.otari-pagination,\s*\.otari-settings \{\s*--field-height: 2rem;/,
     )
     // The phone override raises the two places whose height is keyed on width.
     // The pager is the third and is not here: it raises on `pointer: coarse`
     // instead, asserted below, because a fine pointer at a narrow width is a
     // resized desktop window rather than a finger.
     expect(CSS).toMatch(
-      /@media \(max-width: 767px\) \{\s*\.otari-toolbar,\s*\.otari-settings \{\s*--field-height: 44px;/,
+      /@media \(max-width: 767px\) \{\s*\.otari-toolbar,\s*\.otari-settings \{\s*--field-height: 2.75rem;/,
     )
   })
 
@@ -1375,7 +1450,7 @@ describe("the phone viewport's touch-target floor", () => {
   // `[data-slot="button"]` reaches none of them.
   it("raises the pager's own fields with its buttons on a coarse pointer", () => {
     expect(CSS).toMatch(
-      /@media \(pointer: coarse\)[\s\S]*?\.otari-pagination \{\s*--field-height: 44px;/,
+      /@media \(pointer: coarse\)[\s\S]*?\.otari-pagination \{\s*--field-height: 2.75rem;/,
     )
   })
 
@@ -1385,7 +1460,7 @@ describe("the phone viewport's touch-target floor", () => {
     // that renders in one, so making it a place would put the dense height on
     // an `.input` a future cell might hold.
     expect(CSS).toMatch(
-      /\.table__cell \.select__trigger \{\s*height: 44px;\s*min-height: 44px;/,
+      /\.table__cell \.select__trigger \{\s*height: 2.75rem;\s*min-height: 2.75rem;/,
     )
   })
 
@@ -1398,8 +1473,8 @@ describe("the phone viewport's touch-target floor", () => {
       /\.input,\s*\.select__trigger \{\s*min-height: var\(--field-height\);\s*height: var\(--field-height\);\s*padding-block: var\(--field-padding-block\);/,
     )
     // The default, so a field outside every place still has a height at all.
-    expect(CSS).toMatch(/--field-height: 36px;/)
-    expect(CSS).toMatch(/--field-padding-block: 6px;/)
+    expect(CSS).toMatch(/--field-height: 2.25rem;/)
+    expect(CSS).toMatch(/--field-padding-block: 0.375rem;/)
     // The native search input is not one of HeroUI's classes, so it reads the
     // property through a rule of its own, scoped to the toolbar.
     expect(CSS).toMatch(
@@ -1479,7 +1554,7 @@ describe("a field's trailing glyph is spaced once", () => {
   const margin = stepper.match(/margin-inline-start:\s*([^;]+);/)?.[1].trim()
 
   it("spaces the stepper from the value at all", () => {
-    expect(margin, "nothing spaces the stepper from the value").toBe("8px")
+    expect(margin, "nothing spaces the stepper from the value").toBe("0.5rem")
   })
 
   it("spaces it by the gap the trigger family already uses", () => {
@@ -1697,6 +1772,8 @@ describe("the catalog shows every prop", () => {
       "the fallback for a refused clipboard write, which a story cannot provoke without breaking the clipboard",
     "feedback/FormDialog.returnFocusRef":
       "where focus lands after the frame is gone, which needs the trigger to unmount with it: a story could pass the prop and would demonstrate nothing",
+    "feedback/FormDialog.target":
+      "`RestoreFocus`'s, the helper behind `returnFocusRef`, exported for the feedback dialog; the same reason applies",
   }
 
   // Not props: the first two are every component's, and a leading underscore is

@@ -1,6 +1,13 @@
 import { Button, Spinner } from "@heroui/react"
 import { Link } from "@tanstack/react-router"
-import { type ReactNode, useEffect, useRef, useState } from "react"
+import {
+  type Dispatch,
+  type ReactNode,
+  type SetStateAction,
+  useEffect,
+  useRef,
+  useState,
+} from "react"
 import { FiActivity, FiEdit2, FiTrash2 } from "react-icons/fi"
 import type {
   CreateStoredProviderRequest,
@@ -141,26 +148,72 @@ function ConnectionTestResult({ test }: { test: ConnectionTestState }) {
   )
 }
 
+// Everything the operator can change on each tab, as one value per tab. The
+// drafts outlive the components that render them (only the active tab mounts),
+// so they are held in `AddProviderForm` and passed down whole: a field added
+// here reaches the form, the guard and the reset together, rather than in the
+// three separate edits whose drift `useDirtySnapshot` exists to stop.
+interface KnownProviderDraft {
+  providerId: string
+  apiKey: string
+  apiBase: string
+  name: string
+  clientArgsText: string
+  credentials: CredentialFieldValues
+}
+
+interface CustomProviderDraft {
+  name: string
+  providerType: string
+  apiBase: string
+  apiKey: string
+  clientArgsText: string
+}
+
+const EMPTY_KNOWN_DRAFT: KnownProviderDraft = {
+  providerId: "",
+  apiKey: "",
+  apiBase: "",
+  name: "",
+  clientArgsText: "",
+  credentials: {},
+}
+
+const EMPTY_CUSTOM_DRAFT: CustomProviderDraft = {
+  name: "",
+  providerType: "openai-compatible",
+  apiBase: "",
+  apiKey: "",
+  clientArgsText: "",
+}
+
 // Add a hosted provider whose endpoint is built into the SDK: pick it, paste a
 // key. Name and api_base are only exposed under Advanced.
 function KnownProviderForm({
   isOpen,
   onClose,
   tabs,
+  draft,
+  onChange,
+  isAdvancedShown,
+  setIsAdvancedShown,
+  isDirty,
 }: {
   isOpen: boolean
   onClose: () => void
   tabs: ReactNode
+  draft: KnownProviderDraft
+  // A patch rather than a whole draft, so a field's handler names only the
+  // field it owns.
+  onChange: (patch: Partial<KnownProviderDraft>) => void
+  isAdvancedShown: boolean
+  setIsAdvancedShown: Dispatch<SetStateAction<boolean>>
+  isDirty: boolean
 }) {
+  const { providerId, apiKey, apiBase, name, clientArgsText, credentials } =
+    draft
   const create = useCreateStoredProvider()
   const test = useTestProviderCredentials()
-  const [providerId, setProviderId] = useState("")
-  const [apiKey, setApiKey] = useState("")
-  const [showAdvanced, setShowAdvanced] = useState(false)
-  const [apiBase, setApiBase] = useState("")
-  const [name, setName] = useState("")
-  const [clientArgsText, setClientArgsText] = useState("")
-  const [credentials, setCredentials] = useState<CredentialFieldValues>({})
   const clientArgs = parseClientArgs(clientArgsText)
   const credentialFields = credentialFieldsFor(providerId)
   const credentialErrors = validateCredentialFields(
@@ -173,33 +226,19 @@ function KnownProviderForm({
   // picker itself never imports every provider SDK (issue #365).
   const detail = useProviderDetail(providerId)
   const selected = detail.data?.id === providerId ? detail.data : undefined
-  // Prefill the (editable) API base with the provider's built-in default once its
-  // detail loads, so Advanced shows what will be used. Keyed on the selected
-  // provider so it fires once per selection and does not clobber later edits.
-  useEffect(() => {
-    if (selected) setApiBase(selected.default_api_base ?? "")
-  }, [selected])
   const envKeyPresent = selected?.env_key_present ?? false
   // The key is only mandatory when the provider needs one and its env var is not
   // already set on the server; any-llm falls back to that env var otherwise.
   const needsKey = (selected?.requires_api_key ?? true) && !envKeyPresent
-  const renamed = name.trim() !== "" && name.trim() !== providerId
+  const isRenamed = name.trim() !== "" && name.trim() !== providerId
   const nameHasDelimiter = /[:/]/.test(name)
+  // `isDirty` arrives as a prop rather than being computed here: this component
+  // remounts on every tab switch, and useDirtySnapshot seeds on mount, so a
+  // local snapshot reseeded against already-filled values and read clean. It is
+  // computed once in AddProviderForm over both drafts instead. See feedback.md.
+
   // Require the key when the chosen provider says it needs one; keyless local
   // backends (Ollama, llama.cpp) can submit without it.
-  // One snapshot of everything the form owns, seeded on mount, rather than a
-  // list of fields: the list was two of six, so Advanced's rename, API base,
-  // client options and every typed credential (a Bedrock region) were invisible
-  // to the guard and went on Escape with nothing asked. `key={addOpenCount}`
-  // reseeds it per open. See feedback.md.
-  const { isDirty } = useDirtySnapshot({
-    providerId,
-    apiKey,
-    name,
-    apiBase,
-    clientArgsText,
-    credentials,
-  })
   const canSubmit =
     providerId !== "" &&
     !nameHasDelimiter &&
@@ -209,7 +248,7 @@ function KnownProviderForm({
   // Hold the section open while something inside it is what's blocking submit,
   // so collapsing it can't leave a disabled button with its reason off screen.
   // A hide requested meanwhile is remembered and applies once the field is fixed.
-  const advancedOpen = showAdvanced || !clientArgs.ok || nameHasDelimiter
+  const advancedOpen = isAdvancedShown || !clientArgs.ok || nameHasDelimiter
 
   // The typed fields and the JSON textarea are two views of one `client_args`
   // object, so the request body is built in one place for both the save and the
@@ -220,10 +259,10 @@ function KnownProviderForm({
     Object.keys(credentialErrors).length > 0
       ? null
       : {
-          instance: renamed ? name.trim() : providerId,
+          instance: isRenamed ? name.trim() : providerId,
           // A renamed instance is no longer named after its provider, so record
           // the provider it is so routing still resolves.
-          provider_type: renamed ? providerId : null,
+          provider_type: isRenamed ? providerId : null,
           api_base: apiBase.trim() || null,
           api_key: apiKey.trim() || null,
           client_args: mergeCredentialFields(credentials, clientArgs.value),
@@ -262,20 +301,17 @@ function KnownProviderForm({
         label="Provider"
         value={providerId}
         onChange={(id) => {
-          setProviderId(id)
-          setName("")
-          // Clear the API base; the effect above refills it from the provider's
-          // built-in default once this provider's detail loads.
-          setApiBase("")
-          // The typed fields belong to the provider, so a change to it drops
-          // values that no longer have a field to sit in.
-          setCredentials({})
+          // The name, the base and the typed fields all belong to the provider,
+          // so a change to it drops values that no longer have a field to sit
+          // in. AddProviderForm refills the base from the new provider's
+          // built-in default once its detail loads.
+          onChange({ providerId: id, name: "", apiBase: "", credentials: {} })
         }}
         description="Its endpoint is built in."
       />
       <SecretField
         value={apiKey}
-        onChange={setApiKey}
+        onChange={(value) => onChange({ apiKey: value })}
         // The registry names the credential where the provider does not call it
         // an API key; the optional suffix still tracks whether one is needed.
         label={
@@ -302,13 +338,13 @@ function KnownProviderForm({
       <ProviderCredentialFields
         provider={providerId}
         values={credentials}
-        onChange={setCredentials}
+        onChange={(values) => onChange({ credentials: values })}
         errors={credentialErrors}
       />
       <button
         type="button"
         className="self-start text-xs font-medium text-link hover:text-link-hover"
-        onClick={() => setShowAdvanced((v) => !v)}
+        onClick={() => setIsAdvancedShown((v) => !v)}
       >
         {advancedOpen
           ? "Hide advanced"
@@ -320,14 +356,14 @@ function KnownProviderForm({
             <Field
               label="API base"
               value={apiBase}
-              onChange={setApiBase}
+              onChange={(value) => onChange({ apiBase: value })}
               placeholder={selected?.default_api_base ?? "https://…/v1"}
               description="Only if you route through a proxy. Blank uses the built-in default."
             />
             <Field
               label="Name"
               value={name}
-              onChange={setName}
+              onChange={(value) => onChange({ name: value })}
               placeholder={providerId || "instance name"}
               description={
                 nameHasDelimiter ? (
@@ -342,7 +378,7 @@ function KnownProviderForm({
           </div>
           <ClientArgsField
             value={clientArgsText}
-            onChange={setClientArgsText}
+            onChange={(value) => onChange({ clientArgsText: value })}
             error={clientArgs.ok ? null : clientArgs.error}
           />
         </div>
@@ -358,30 +394,25 @@ function CustomProviderForm({
   isOpen,
   onClose,
   tabs,
+  draft,
+  onChange,
+  isDirty,
 }: {
   isOpen: boolean
   onClose: () => void
   tabs: ReactNode
+  draft: CustomProviderDraft
+  onChange: (patch: Partial<CustomProviderDraft>) => void
+  isDirty: boolean
 }) {
+  const { name, providerType, apiBase, apiKey, clientArgsText } = draft
   const create = useCreateStoredProvider()
   const test = useTestProviderCredentials()
-  const [name, setName] = useState("")
-  const [providerType, setProviderType] = useState("openai-compatible")
-  const [apiBase, setApiBase] = useState("")
-  const [apiKey, setApiKey] = useState("")
-  const [clientArgsText, setClientArgsText] = useState("")
   const clientArgs = parseClientArgs(clientArgsText)
 
   const nameHasDelimiter = /[:/]/.test(name)
-  // Same snapshot as the known tab, for the same reason: this list had missed
-  // `providerType` and the client options.
-  const { isDirty } = useDirtySnapshot({
-    name,
-    providerType,
-    apiBase,
-    apiKey,
-    clientArgsText,
-  })
+  // isDirty is a prop for the same reason it is on the known tab: this
+  // component remounts per tab switch, so a local snapshot reads clean.
   const canSubmit =
     name.trim() !== "" &&
     !nameHasDelimiter &&
@@ -438,7 +469,7 @@ function CustomProviderForm({
         <Field
           label="Name"
           value={name}
-          onChange={setName}
+          onChange={(value) => onChange({ name: value })}
           placeholder="my-local-llm"
           isRequired
           autoFocus
@@ -455,7 +486,7 @@ function CustomProviderForm({
         <ProviderComboBox
           label="Compatible with"
           value={providerType}
-          onChange={setProviderType}
+          onChange={(value) => onChange({ providerType: value })}
           includeCatalog={false}
           description="The API this endpoint speaks."
           extra={[
@@ -467,20 +498,20 @@ function CustomProviderForm({
       <Field
         label="API base"
         value={apiBase}
-        onChange={setApiBase}
+        onChange={(value) => onChange({ apiBase: value })}
         placeholder="http://localhost:8000/v1"
         isRequired
         description="The endpoint URL of your server."
       />
       <SecretField
         value={apiKey}
-        onChange={setApiKey}
+        onChange={(value) => onChange({ apiKey: value })}
         label="API key (optional)"
         description="Many local backends need none. Stored encrypted."
       />
       <ClientArgsField
         value={clientArgsText}
-        onChange={setClientArgsText}
+        onChange={(value) => onChange({ clientArgsText: value })}
         error={clientArgs.ok ? null : clientArgs.error}
       />
       <ConnectionTestResult test={test} />
@@ -502,8 +533,8 @@ type ProviderTab = "known" | "custom"
  *
  * What is shared is the frame. Each half renders the same `FormDialog` with the
  * same title, size and tab row, so switching tabs changes the fields and
- * nothing else, and a half-filled tab still does not survive a switch away from
- * it, which is what it did as a panel.
+ * nothing else. Only the active tab's `FormDialog` is mounted; field values for
+ * both tabs are lifted into this component so they survive a switch away.
  */
 function AddProviderForm({
   isOpen,
@@ -513,6 +544,66 @@ function AddProviderForm({
   onClose: () => void
 }) {
   const [tab, setTab] = useState<ProviderTab>("known")
+
+  // Both drafts are held here: only the active tab mounts, so a draft kept in
+  // the tab component went with it on a switch.
+  const [knownDraft, setKnownDraft] = useState(EMPTY_KNOWN_DRAFT)
+  const [customDraft, setCustomDraft] = useState(EMPTY_CUSTOM_DRAFT)
+  // Advanced is the tab's own disclosure rather than a field, so it is not part
+  // of the draft the guard reads; it is lifted for the same reason.
+  const [knownIsAdvancedShown, setKnownIsAdvancedShown] = useState(false)
+  // Which provider the known draft's API base was seeded from, so a base the
+  // operator typed is never overwritten by a later render. Empty means not yet
+  // seeded, the same way `providerId` spells no provider chosen; no catalog
+  // entry has an empty id, so it cannot collide with a real one.
+  const [apiBaseSeededFor, setApiBaseSeededFor] = useState("")
+
+  // Choosing a provider invalidates the seed, and so does clearing the picker:
+  // both arrive here as a change to `providerId`. Reset in the one place that
+  // owns both halves, rather than leaving each caller to remember.
+  const changeKnownDraft = (patch: Partial<KnownProviderDraft>) => {
+    setKnownDraft((current) => ({ ...current, ...patch }))
+    if (patch.providerId !== undefined) setApiBaseSeededFor("")
+  }
+  const changeCustomDraft = (patch: Partial<CustomProviderDraft>) => {
+    setCustomDraft((current) => ({ ...current, ...patch }))
+  }
+
+  // Prefill the (editable) API base with the provider's built-in default once
+  // its detail loads, so Advanced shows what will be used. It sits beside the
+  // state it writes rather than in the tab: that component remounts on every
+  // switch while the draft does not, so a mount-keyed effect there answered
+  // from cache on the first render back and overwrote a hand-edited base. The
+  // query is the same one the tab reads, so this observer shares its cache
+  // rather than issuing a second request.
+  const knownDetail = useProviderDetail(knownDraft.providerId)
+  const knownSelected =
+    knownDetail.data?.id === knownDraft.providerId
+      ? knownDetail.data
+      : undefined
+  useEffect(() => {
+    if (!knownSelected || apiBaseSeededFor === knownSelected.id) return
+    // Mark the provider seeded either way, so a base cleared later is not taken
+    // as an invitation to fill it in again.
+    setApiBaseSeededFor(knownSelected.id)
+    setKnownDraft((current) =>
+      // Only fill a base nobody has typed. Choosing the provider is what blanks
+      // it, so anything here by the time its detail lands was typed during the
+      // request and outranks the built-in default.
+      current.apiBase === ""
+        ? { ...current, apiBase: knownSelected.default_api_base ?? "" }
+        : current,
+    )
+  }, [knownSelected, apiBaseSeededFor])
+
+  // One snapshot over both drafts, held here rather than in either tab
+  // component. The drafts outlive a tab switch but the components do not, and
+  // useDirtySnapshot seeds on mount, so a snapshot taken inside a tab reseeded
+  // against already-filled values and read clean: Escape then closed with the
+  // pasted key and nothing asked. Held here it also covers the inactive tab,
+  // which a per-tab snapshot could not see at all. See feedback.md.
+  const { isDirty } = useDirtySnapshot({ knownDraft, customDraft })
+
   const tabs = (
     <TabRow>
       {(
@@ -528,10 +619,31 @@ function AddProviderForm({
     </TabRow>
   )
 
-  return tab === "known" ? (
-    <KnownProviderForm isOpen={isOpen} onClose={onClose} tabs={tabs} />
-  ) : (
-    <CustomProviderForm isOpen={isOpen} onClose={onClose} tabs={tabs} />
+  return (
+    <>
+      {tab === "known" && (
+        <KnownProviderForm
+          isOpen={isOpen}
+          onClose={onClose}
+          tabs={tabs}
+          draft={knownDraft}
+          onChange={changeKnownDraft}
+          isAdvancedShown={knownIsAdvancedShown}
+          setIsAdvancedShown={setKnownIsAdvancedShown}
+          isDirty={isDirty}
+        />
+      )}
+      {tab === "custom" && (
+        <CustomProviderForm
+          isOpen={isOpen}
+          onClose={onClose}
+          tabs={tabs}
+          draft={customDraft}
+          onChange={changeCustomDraft}
+          isDirty={isDirty}
+        />
+      )}
+    </>
   )
 }
 
@@ -588,10 +700,10 @@ function EditProviderForm({
     clientArgsText,
     credentials,
   })
-  const blocked = !clientArgs.ok || Object.keys(credentialErrors).length > 0
+  const isBlocked = !clientArgs.ok || Object.keys(credentialErrors).length > 0
 
   const submit = () => {
-    if (update.isPending || blocked) return
+    if (update.isPending || isBlocked) return
     const body: UpdateStoredProviderRequest = {
       provider_type: providerType.trim() || null,
       api_base: apiBase.trim() || null,
@@ -632,7 +744,7 @@ function EditProviderForm({
       submitLabel="Save"
       onSubmit={submit}
       isPending={update.isPending}
-      isSubmitDisabled={blocked}
+      isSubmitDisabled={isBlocked}
       isDirty={isDirty}
       error={update.error}
     >
@@ -643,14 +755,14 @@ function EditProviderForm({
           onChange={setProviderType}
           placeholder="openai"
           autoFocus
-          reserveMessage={false}
+          shouldReserveMessage={false}
         />
         <Field
           label="API base"
           value={apiBase}
           onChange={setApiBase}
           placeholder="https://api.openai.com/v1"
-          reserveMessage={false}
+          shouldReserveMessage={false}
         />
       </div>
       <div className="flex flex-col gap-2">
@@ -718,8 +830,12 @@ function buildRows(
   meta: ProviderInfo[] | undefined,
   stored: StoredProvider[] | undefined,
 ): ProviderRow[] {
-  const storedByInstance = new Map((stored ?? []).map((p) => [p.instance, p]))
-  const metaByInstance = new Map((meta ?? []).map((p) => [p.instance, p]))
+  const storedByInstance = new Map(
+    (stored ?? []).map((provider) => [provider.instance, provider]),
+  )
+  const metaByInstance = new Map(
+    (meta ?? []).map((provider) => [provider.instance, provider]),
+  )
   const instances = new Set<string>([
     ...storedByInstance.keys(),
     ...metaByInstance.keys(),
@@ -802,19 +918,19 @@ function HealthPill({ health }: { health: ProviderHealth | undefined }) {
   if (!health) {
     return <span className="text-caption">—</span>
   }
-  const degraded = !health.ok && health.discovery_unsupported
+  const isDegraded = !health.ok && health.discovery_unsupported
   // Only a real failure colors its text. Degraded is a provider that answers
   // requests but lists no models, which is a fact about discovery rather than an
   // outage, so it reads on the muted rung with the danger dot that says "worth
   // noticing" without the ink that says "broken".
-  const styles = health.ok || degraded ? "text-muted" : "text-danger"
+  const styles = health.ok || isDegraded ? "text-muted" : "text-danger"
   const dot = health.ok ? "bg-success" : "bg-danger"
   // The last-checked time lives in the top summary banner; the row just shows the
   // status. The error (and time) stay available on hover as the pill's tooltip.
   const checked = health.checked_at
     ? `Last checked ${formatRelative(health.checked_at)}`
     : "Not checked yet"
-  const reason = degraded
+  const reason = isDegraded
     ? `${health.error ?? "This provider does not list models."} Requests to it may still work.`
     : (health.error ?? "Unreachable")
   const title = health.ok ? checked : `${reason} · ${checked}`
@@ -824,7 +940,11 @@ function HealthPill({ health }: { health: ProviderHealth | undefined }) {
       className={`flex items-center gap-2 text-mono-caption ${styles}`}
     >
       <Dot className={dot} />
-      {HEALTH_LABELS[health.ok ? "ok" : degraded ? "degraded" : "unreachable"]}
+      {
+        HEALTH_LABELS[
+          health.ok ? "ok" : isDegraded ? "degraded" : "unreachable"
+        ]
+      }
     </span>
   )
 }
@@ -913,13 +1033,13 @@ function OnboardingPanel({
   onAddProvider,
   needsPricing,
   onEnablePricing,
-  enabling,
+  isEnabling,
   secretKeyConfigured,
 }: {
   onAddProvider: () => void
   needsPricing: boolean
   onEnablePricing: () => void
-  enabling: boolean
+  isEnabling: boolean
   secretKeyConfigured: boolean
 }) {
   return (
@@ -950,7 +1070,7 @@ function OnboardingPanel({
           Once a provider exists, the <strong>Overview</strong> page usually
           offers a setup guide that hands you an API key and the call to make.
           Either way, point your app at <code>/v1</code> on this gateway with an
-          API key (the one printed in the server logs starts <code>gw-…</code>).
+          API key (the one printed in the server logs on first start will do).
           See the{" "}
           {/* /welcome is served by the gateway itself, not by a client route, so this
                 stays a plain path anchor: a router Link would resolve to /#/welcome, which
@@ -974,7 +1094,7 @@ function OnboardingPanel({
           <button
             type="button"
             className="font-medium text-link hover:text-link-hover disabled:opacity-(--disabled-opacity)"
-            disabled={enabling}
+            disabled={isEnabling}
             onClick={onEnablePricing}
           >
             Enable default pricing
@@ -1011,7 +1131,7 @@ export function ProvidersPage() {
 
   const [addOpen, setAddOpen] = useState(false)
   const [addOpenCount, setAddOpenCount] = useState(0)
-  const [editing, setEditing] = useState<string | null>(null)
+  const [editing, setEditing] = useState<string>()
   const [pendingDelete, setPendingDelete] = useState<string>()
   const [tests, setTests] = useState<Record<string, TestState>>({})
   // `addOpenCount` above is bumped on each open, and the add form is keyed on
@@ -1021,7 +1141,7 @@ export function ProvidersPage() {
   // operator. See feedback.md, "A draft is fresh on every open and untouched
   // through the exit". Both openers on this page go through here.
   const openAdd = () => {
-    setEditing(null)
+    setEditing(undefined)
     setAddOpenCount((n) => n + 1)
     setAddOpen(true)
   }
@@ -1031,8 +1151,9 @@ export function ProvidersPage() {
     (health.data?.providers ?? []).map((item) => [item.instance, item]),
   )
   const loading = meta.isLoading || stored.isLoading
-  const editingProvider =
-    stored.data?.find((p) => p.instance === editing) ?? null
+  const editingProvider = stored.data?.find(
+    (provider) => provider.instance === editing,
+  )
   const needsPricing =
     settings.data?.require_pricing === true &&
     settings.data.default_pricing === false
@@ -1225,7 +1346,7 @@ export function ProvidersPage() {
   return (
     <div className="flex flex-col gap-6">
       <PageIntro
-        title="Providers"
+        title="Deployment providers"
         action={
           <Button
             // Visible while the dialog is open and beside the first-run
@@ -1302,7 +1423,7 @@ export function ProvidersPage() {
           onEnablePricing={() =>
             updateSettings.mutate({ default_pricing: true })
           }
-          enabling={updateSettings.isPending}
+          isEnabling={updateSettings.isPending}
           secretKeyConfigured={secretKeyConfigured}
         />
       ) : null}
@@ -1326,7 +1447,7 @@ export function ProvidersPage() {
           // which a save would then write onto this one.
           key={editingProvider.instance}
           provider={editingProvider}
-          onClose={() => setEditing(null)}
+          onClose={() => setEditing(undefined)}
           onSaved={clearTest}
         />
       ) : null}

@@ -59,13 +59,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import col
 
 from gateway.core.config import API_ROOT, OAUTH_PROVIDERS, GatewayConfig
+from gateway.exceptions.identity_exceptions import OAuthExchangeError, OAuthNotConfiguredError, OAuthStateError
 from gateway.log_config import logger
 from gateway.models.tenancy import OAUTH_STATE_TTL_SECONDS, OAuthPendingState
-from gateway.services.tenancy.errors import (
-    OAuthExchangeError,
-    OAuthNotConfiguredError,
-    OAuthStateError,
-)
 
 # Which scopes each provider is asked for, and what it calls itself.
 #
@@ -155,12 +151,12 @@ def redirect_uri(config: GatewayConfig, provider: str) -> str:
 def base_url(config: GatewayConfig) -> str:
     """This deployment's own address with no trailing slash, or an empty string.
 
-    One reading of ``public_base_url`` for everything OAuth derives from it, so
-    the authorization request, the exchange, and the redirect that lands a
-    browser back all agree. It may carry a **path prefix**: a gateway served at
-    ``https://example.com/otari`` is a supported shape, and ``Mailer.link``
-    already builds its links that way, so a root-absolute answer here would send
-    such a deployment's callback to the wrong origin path.
+    One reading of ``public_base_url`` for everything that has to name this
+    process, so the authorization request and the exchange name one redirect
+    URI between them. It may carry a **path prefix**: a gateway served at
+    ``https://example.com/otari`` is a supported shape, so a root-absolute
+    answer here would send such a deployment's callback to the wrong origin
+    path.
     """
     return (config.public_base_url or "").rstrip("/")
 
@@ -168,16 +164,17 @@ def base_url(config: GatewayConfig) -> str:
 def callback_landing_target(config: GatewayConfig, provider: str, query: str) -> str:
     """Where ``/auth/{provider}/callback`` sends the browser to finish signing in.
 
-    The dashboard's own hash route, carrying whatever query the provider
-    appended. Built here rather than in the route so it reads the same
-    ``public_base_url`` the redirect URI does, path prefix included.
+    The interface's own hash route, carrying whatever query the provider
+    appended. Built from ``effective_ui_base_url`` and not the redirect URI's
+    base: the ``state`` in that query is checked against a value scoped to the
+    origin that minted it, so a browser landed elsewhere cannot finish.
 
     Relative to that base rather than to the request, because the request's path
     is what a reverse proxy may already have rewritten, and this has to name a
     URL in the browser's address bar rather than in this process.
     """
-    target = f"{base_url(config)}/#/auth/{quote(provider, safe='')}/callback"
-    return f"{target}?{query}" if query else target
+    route = f"/#/auth/{quote(provider, safe='')}/callback"
+    return config.ui_link(f"{route}?{query}" if query else route)
 
 
 class _DatabaseStateStore:

@@ -44,7 +44,7 @@ export function Select({
   isDisabled,
   isInvalid,
   errorMessage,
-  reserveMessage,
+  shouldReserveMessage,
   className = "",
 }: {
   label: string
@@ -62,7 +62,7 @@ export function Select({
   isInvalid?: boolean
   /** Shown under the field and announced with it. Needs `isInvalid` to appear. */
   errorMessage?: string
-  reserveMessage?: boolean
+  shouldReserveMessage?: boolean
   /** Layout and width at the call site. Not for restyling the trigger. */
   className?: string
 }) {
@@ -101,8 +101,15 @@ export function Select({
           adding one renders two. */}
       <Label className="text-body">{label}</Label>
       <HeroSelect.Trigger autoFocus={autoFocus}>
+        {/* `isPlaceholder` and not a nullish check on `selectedText`, which
+            reads as the same test and is not: react-aria reports an empty
+            selection as `""`, so `selectedText ?? placeholder` renders a blank
+            slot. HeroUI's `data-placeholder` comes off this same flag, so the
+            text and the ink that marks it as a hint always agree. */}
         <HeroSelect.Value>
-          {({ selectedText }) => selectedText ?? placeholder}
+          {({ isPlaceholder, selectedText }) =>
+            isPlaceholder ? placeholder : selectedText
+          }
         </HeroSelect.Value>
         <HeroSelect.Indicator />
       </HeroSelect.Trigger>
@@ -119,7 +126,7 @@ export function Select({
           )}
         </ListBox>
       </HeroSelect.Popover>
-      <FieldMessages reserve={reserveMessage}>
+      <FieldMessages shouldReserve={shouldReserveMessage}>
         {description ? (
           <Description className="text-muted">{description}</Description>
         ) : null}

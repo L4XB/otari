@@ -19,13 +19,15 @@ over the credential it was never shown.
 import uuid
 from datetime import UTC, datetime
 
-from gateway.models.entities import OrganizationGuardrail, ProviderCredential, SearchToolCredential
+from gateway.models.guardrails import OrganizationGuardrail
+from gateway.models.providers import ProviderCredential
 from gateway.models.secret_fields import (
     _MAX_NESTING_DEPTH,
     REDACTED_VALUE,
     redact_secret_like_values,
     restore_redacted_values,
 )
+from gateway.models.tools import SearchToolCredential
 from gateway.services.tenancy.organization_guardrail_service import OrganizationGuardrailPublic
 
 

@@ -1,9 +1,9 @@
-import { screen } from "@testing-library/react"
+import { screen, within } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
 import { afterEach, describe, expect, it, vi } from "vitest"
 
 import { AccountMenu } from "@/app/nav/AccountMenu"
-import type { DeploymentBootstrap, OrganizationContext } from "@/client"
+import type { CallerIdentity, DeploymentBootstrap } from "@/client"
 import { useOrganizationContext } from "@/shared/api/organizations"
 import { DeploymentProvider } from "@/shared/hooks/useDeployment"
 import {
@@ -14,20 +14,41 @@ import {
 import { AppProviders } from "@/tests/providers"
 import { renderWithRouter } from "@/tests/router"
 
+// The badge seam, kept real unless a case sets a label: the cases about the
+// name and the rows see this build's monogram, and the one about the seam
+// sees what a build that draws something else there would.
+const badge = vi.hoisted(() => ({ label: "" }))
+vi.mock("@/app/nav/overlayAccountBadge", async (importOriginal) => {
+  const real =
+    await importOriginal<typeof import("@/app/nav/overlayAccountBadge")>()
+  return {
+    AccountBadge: (props: { initials: string }) =>
+      badge.label ? <span>EU</span> : <real.AccountBadge {...props} />,
+    useAccountBadgeLabel: () => badge.label,
+  }
+})
+
 // The trigger names the person, and the person is a field on the membership
 // context, so it is stubbed at fetch like the sidebar's own read of it. Every
 // case installs one, including the ones about the menu's rows: the component
 // makes that request either way, and an unstubbed `fetch` would leave it
 // failing in the background of a test that is not about it.
-function mockCaller(caller: OrganizationContext["caller"]) {
-  vi.spyOn(globalThis, "fetch").mockImplementation(async () =>
-    Response.json(organizationContext({ caller })),
-  )
-}
-
 // The identity a standalone first boot leaves behind, which the fixture already
 // describes: a name and no address.
-const OPERATOR = organizationContext().caller
+const OPERATOR = organizationContext().caller as CallerIdentity
+
+// The argument is merged onto that identity rather than replacing it, so a case
+// about a name or an address spells only the field it is about. `null` is the
+// other thing the context can report, which is no identity at all.
+function mockCaller(caller: Partial<CallerIdentity> | null = {}) {
+  vi.spyOn(globalThis, "fetch").mockImplementation(async () =>
+    Response.json(
+      organizationContext({
+        caller: caller === null ? undefined : { ...OPERATOR, ...caller },
+      }),
+    ),
+  )
+}
 
 // The other thing that read can do. The trigger names nobody rather than
 // guessing, for the same reason it does before the answer lands.
@@ -48,11 +69,27 @@ function CallerProbe() {
 
 // The menu holds a router Link, so it needs a real router; `renderWithRouter`
 // mounts it at "/" and resolves the first location before the assertions run.
-async function renderMenu(overrides: Partial<DeploymentBootstrap> = {}) {
+type MenuOptions = Partial<DeploymentBootstrap> & {
+  deploymentLanding?: string
+  onOpenFeedback?: () => void
+  onOpenDeploymentLevel?: () => void
+}
+
+async function renderMenu({
+  deploymentLanding,
+  onOpenDeploymentLevel,
+  onOpenFeedback,
+  ...overrides
+}: MenuOptions = {}) {
   await renderWithRouter(
     <AppProviders>
       <DeploymentProvider value={bootstrap(overrides)}>
-        <AccountMenu collapsed={false} />
+        <AccountMenu
+          isCollapsed={false}
+          deploymentLanding={deploymentLanding as never}
+          onOpenDeploymentLevel={onOpenDeploymentLevel}
+          onOpenFeedback={onOpenFeedback}
+        />
         <CallerProbe />
       </DeploymentProvider>
     </AppProviders>,
@@ -64,7 +101,7 @@ function settled(): Promise<HTMLElement> {
   return screen.findByText("standing settled")
 }
 
-async function openMenu(overrides: Partial<DeploymentBootstrap> = {}) {
+async function openMenu(overrides: MenuOptions = {}) {
   await renderMenu(overrides)
   // The trigger's accessible name carries who is signed in, so it is matched on
   // its prefix rather than in full.
@@ -78,6 +115,25 @@ afterEach(() => {
 })
 
 describe("AccountMenu", () => {
+  it("keeps Playground reachable on mobile before Documentation", async () => {
+    mockCaller(OPERATOR)
+    await openMenu()
+    const link = screen.getByRole("link", { name: "Playground" })
+    expect(link).toHaveAttribute("href", "/playground")
+    expect(link).toHaveClass("md:hidden")
+    expect(link.nextElementSibling).toBe(
+      screen.getByRole("link", { name: "Documentation" }),
+    )
+  })
+
+  it("omits Playground from the mobile menu when unavailable", async () => {
+    mockCaller(OPERATOR)
+    await openMenu({ surfaces: [] })
+    expect(
+      screen.queryByRole("link", { name: "Playground" }),
+    ).not.toBeInTheDocument()
+  })
+
   it("opens the account page, rather than naming a destination it cannot reach", async () => {
     mockCaller(OPERATOR)
     await openMenu()
@@ -260,10 +316,106 @@ describe("AccountMenu", () => {
   })
 
   it("names nobody when the deployment reports no identity at all", async () => {
-    mockCaller(undefined)
+    mockCaller(null)
     await renderMenu()
     await settled()
 
     expect(screen.getByText("Signed in")).toBeInTheDocument()
+  })
+  describe("the Deployment row", () => {
+    it("offers one row that opens the deployment rail, with the mark it opens", async () => {
+      mockCaller(OPERATOR)
+      await openMenu({ deploymentLanding: "/settings" })
+      await settled()
+
+      const row = screen.getByRole("link", { name: "Deployment" })
+      expect(row).toHaveAttribute("href", "/settings")
+      // Not the pages themselves: the row changes which rail is showing, the
+      // way the Organization row in the footer does.
+      expect(screen.queryByRole("link", { name: "Accounts" })).toBeNull()
+    })
+
+    it("shows no row when that rail has nothing for this caller", async () => {
+      // The shell resolves the landing through the same predicate the rail runs,
+      // so a caller who operates nothing there gets no control into a rail with
+      // no rows. Absent, not disabled: a disabled row would tell them a place
+      // exists that the deployment declines to admit exists.
+      mockCaller(OPERATOR)
+      await openMenu()
+      await settled()
+
+      expect(screen.queryByRole("link", { name: "Deployment" })).toBeNull()
+      expect(
+        screen.getByRole("link", { name: "Account settings" }),
+      ).toBeInTheDocument()
+    })
+
+    it("opens a level instead of navigating when the shell asks it to", async () => {
+      // Below `md` the rail opens it as a level inside the drawer, so the row is
+      // a button: the page behind the drawer has not moved and a link would
+      // claim it had.
+      const onOpen = vi.fn()
+      mockCaller(OPERATOR)
+      await openMenu({
+        deploymentLanding: "/settings",
+        onOpenDeploymentLevel: onOpen,
+      })
+      await settled()
+
+      expect(screen.queryByRole("link", { name: "Deployment" })).toBeNull()
+      await userEvent
+        .setup()
+        .click(screen.getByRole("button", { name: "Deployment" }))
+      expect(onOpen).toHaveBeenCalledTimes(1)
+    })
+  })
+})
+
+it("opens feedback from a phone-only row right after Documentation", async () => {
+  mockCaller(OPERATOR)
+  const onOpenFeedback = vi.fn()
+  await openMenu({ feedback_enabled: true, onOpenFeedback })
+  const trigger = screen.getByRole("button", { name: "Feedback" })
+  // From md up the top bar carries it, as it carries Documentation.
+  expect(trigger).toHaveClass("md:hidden")
+  expect(trigger.previousElementSibling).toBe(
+    screen.getByRole("link", { name: "Documentation" }),
+  )
+  await userEvent.setup().click(trigger)
+  expect(onOpenFeedback).toHaveBeenCalledOnce()
+})
+
+it("hides the feedback row when the deployment has feedback off", async () => {
+  mockCaller(OPERATOR)
+  await openMenu({ feedback_enabled: false, onOpenFeedback: vi.fn() })
+  expect(
+    screen.queryByRole("button", { name: "Feedback" }),
+  ).not.toBeInTheDocument()
+})
+
+describe("the badge seam", () => {
+  afterEach(() => {
+    badge.label = ""
+  })
+
+  it("draws this build's monogram and adds nothing to the name", async () => {
+    mockCaller({ full_name: "Ada Lovelace" })
+    await renderMenu()
+
+    const trigger = await screen.findByRole("button", {
+      name: "Account: Ada Lovelace",
+    })
+    expect(within(trigger).queryByText("EU")).toBeNull()
+  })
+
+  it("draws what a build contributes and folds its words into the name", async () => {
+    badge.label = "Europe region"
+    mockCaller({ full_name: "Ada Lovelace" })
+    await renderMenu()
+
+    const trigger = await screen.findByRole("button", {
+      name: "Account: Ada Lovelace, Europe region",
+    })
+    expect(within(trigger).getByText("EU")).toBeInTheDocument()
   })
 })

@@ -14,8 +14,9 @@ selector is resolved against (``alias_service``, ``policy_store``), which
 applies to every selector shape. Separately, it selects **whose
 organization-scoped provider keys** may supply credentials (otari-ai#1748,
 otari#643): a second, disjoint credential source, consulted only for a *bare*
-``provider:model``/``provider/model`` selector, i.e. one with no matching
-``config.providers`` instance. An ``instance:model`` selector always draws its
+``provider:model`` selector, i.e. one with no matching ``config.providers``
+instance, and which organization's own offerings the catalog spellings below
+may resolve to. An ``instance:model`` selector always draws its
 credentials from ``config.providers`` exactly as before and never touches
 organization-scoped keys, by construction: the two addressing schemes occupy
 disjoint selector shapes rather than one layering over the other. See
@@ -28,8 +29,12 @@ organization, not every organization the gateway holds. See
 one workspace at all.
 """
 
+import hashlib
+import hmac
+import json
 import os
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -37,10 +42,13 @@ from any_llm import AnyLLM, LLMProvider
 from any_llm.exceptions import AnyLLMError
 
 from gateway.auth.vertex_auth import setup_vertex_environment
-from gateway.core.config import GatewayConfig, provider_credential_env_names
+from gateway.core.config import KEYLESS_SELF_HOSTED_PROVIDERS, GatewayConfig, provider_credential_env_names
+from gateway.log_config import logger
 from gateway.services.alias_service import resolve_effective_alias
+from gateway.services.catalog_selectors import resolve_catalog_selector
 from gateway.services.policy_store import resolve_effective_policy
 from gateway.services.tenancy.org_provider_key_service import cached_org_provider_kwargs
+from gateway.types.provider_account import ProviderAccount, ResolvedCredential
 
 # Keys that describe an instance to otari but are not credentials any-llm
 # understands, so they must be stripped before the provider call.
@@ -57,19 +65,13 @@ _INSTANCE_META_KEYS = ("provider_type", "models")
 # tolerance (mozilla-ai/any-llm#1198).
 _KEYLESS_PLACEHOLDER_API_KEY = "otari-no-key-required"
 
-# Two sets of providers any-llm calls without an otari-visible credential, even
-# though each *declares* a credential environment variable.
-# ``provider_credential_env_names`` sees only the declaration, so it cannot tell
-# them from a keyed provider the way it can ollama/llamacpp/llamafile (which
+# Providers any-llm calls without an otari-visible credential, even though each
+# *declares* a credential environment variable, so ``provider_credential_env_names``
+# cannot tell them from a keyed provider the way it can ollama/llamafile (which
 # declare the literal ``"None"``) or Vertex AI (which declares an empty name).
-# Both are written out by hand and both are drift-guarded in
-# ``tests/unit/test_provider_instances.py``.
+# The self-hosted ones are ``KEYLESS_SELF_HOSTED_PROVIDERS``; this set is drift-guarded
+# alongside it in ``tests/unit/test_provider_instances.py``.
 #
-# Local and LAN backends that never require a key: each overrides
-# ``_verify_and_set_api_key`` to return without raising and defaults to a
-# localhost or LAN base URL, so a bare ``vllm:my-model`` reaches a self-hosted
-# server today with nothing configured in otari at all.
-_KEYLESS_SELF_HOSTED_PROVIDERS = frozenset({"vllm", "lmstudio", "cascadia", "otari"})
 # Providers authenticating from cloud SDK credentials this gateway cannot see:
 # an EC2 instance profile, an SSO session, or an ambient boto3 chain. They are
 # the same category as Vertex AI's application default credentials, which
@@ -90,6 +92,10 @@ _AMBIENT_CREDENTIAL_PROVIDERS = frozenset({"bedrock", "sagemaker"})
 # that answered. ``api_base`` is deliberately absent: an instance with a base URL
 # and no key takes the keyless placeholder, so it never reaches a caller alone.
 _NON_CREDENTIAL_KWARGS = frozenset({"client_args"})
+
+# Providers already warned about reaching any-llm on their env var alone, so the
+# deprecation is logged once per provider per process rather than per request.
+_undeclared_env_warned: set[str] = set()
 
 
 def _kwargs_carry_a_credential(kwargs: dict[str, Any]) -> bool:
@@ -113,6 +119,34 @@ def _provider_env_key_present(provider: LLMProvider) -> bool:
     the config layer so both agree on which variables carry a credential.
     """
     return any(os.getenv(name) for name in provider_credential_env_names(provider.value) or ())
+
+
+def _warn_undeclared_env_provider(config: GatewayConfig, provider: LLMProvider) -> None:
+    """Log, once per provider, that a standalone call rides the env-var fallback.
+
+    Reached when nothing declares the provider (no ``config.providers`` entry, no
+    organization-scoped key) and any-llm will authenticate from the provider's
+    native variable instead. That fallback is deprecated: such a provider serves
+    requests but is missing from model discovery. Hybrid mode resolves every
+    credential from the platform and hosted mode serves no inference, so neither
+    warns.
+    """
+    if config.is_hybrid_mode or config.is_hosted_mode or provider.value in _undeclared_env_warned:
+        return
+    env_name = next((name for name in provider_credential_env_names(provider.value) or () if os.getenv(name)), None)
+    if env_name is None:
+        return
+    _undeclared_env_warned.add(provider.value)
+    logger.warning(
+        "Provider '%s' is not declared under providers: and is being called with its %s environment variable. "
+        "This fallback is deprecated and will stop working in a future release, and the provider's models are "
+        "not listed meanwhile. Declare it in config.yml (providers: {%s: {api_key: ${%s}}}) or on the "
+        "dashboard's Providers page.",
+        provider.value,
+        env_name,
+        provider.value,
+        env_name,
+    )
 
 
 def keyless_placeholder_api_key(provider: LLMProvider, api_base: Any, api_key: Any) -> str | None:
@@ -152,9 +186,9 @@ def credential_ladder_exhausted(provider: LLMProvider, kwargs: dict[str, Any]) -
     caller that might serve it from somewhere else. A deployment pointing at its
     own backends is served upstream of anything reading this. They come in two
     shapes: those declaring no credential variable at all (the keyless local
-    backends ollama, llamacpp and llamafile, and Vertex AI, which authenticates
+    backends ollama and llamafile, and Vertex AI, which authenticates
     through the cloud SDK), and those declaring one any-llm does not insist on
-    (``_KEYLESS_SELF_HOSTED_PROVIDERS`` and ``_AMBIENT_CREDENTIAL_PROVIDERS``).
+    (``KEYLESS_SELF_HOSTED_PROVIDERS`` and ``_AMBIENT_CREDENTIAL_PROVIDERS``).
 
     ``provider_credential_env_names`` returns ``None`` rather than ``()`` for a
     provider it cannot inspect at all, and that stays exhausted: nothing is known
@@ -163,7 +197,7 @@ def credential_ladder_exhausted(provider: LLMProvider, kwargs: dict[str, Any]) -
     """
     if _kwargs_carry_a_credential(kwargs):
         return False
-    if provider.value in _KEYLESS_SELF_HOSTED_PROVIDERS or provider.value in _AMBIENT_CREDENTIAL_PROVIDERS:
+    if provider.value in KEYLESS_SELF_HOSTED_PROVIDERS or provider.value in _AMBIENT_CREDENTIAL_PROVIDERS:
         return False
     if provider_credential_env_names(provider.value) == ():
         return False
@@ -222,12 +256,68 @@ def get_provider_kwargs(
             kwargs = {k: v for k, v in provider_config.items() if k != "client_args"}
             if "client_args" in provider_config:
                 kwargs["client_args"] = provider_config["client_args"]
+    else:
+        _warn_undeclared_env_provider(config, provider)
 
     placeholder = keyless_placeholder_api_key(provider, kwargs.get("api_base"), kwargs.get("api_key"))
     if placeholder is not None:
         kwargs["api_key"] = placeholder
 
     return kwargs
+
+
+def effective_credential(provider: LLMProvider, kwargs: Mapping[str, Any]) -> ResolvedCredential:
+    """The credential a call made with ``kwargs`` authenticates with.
+
+    That is the key the kwargs carry, or else the provider SDK's own environment
+    variable, which a call carrying no key authenticates with.
+
+    Raises:
+        LookupError: neither holds a key.
+    """
+    api_key = kwargs.get("api_key")
+    if not api_key:
+        api_key = next(
+            (value for name in provider_credential_env_names(provider.value) or () if (value := os.getenv(name))),
+            None,
+        )
+    if not api_key:
+        raise LookupError(f"no credential configured for provider '{provider.value}'")
+    return ResolvedCredential(
+        api_key=str(api_key), api_base=kwargs.get("api_base"), client_args=dict(kwargs.get("client_args") or {})
+    )
+
+
+class ProviderAccounts:
+    """Names the provider accounts one workspace's dispatch credentials reach.
+
+    The name is a keyed digest, HMAC-SHA256 under a pepper kept for this one
+    purpose, so a copy of the database cannot confirm a guessed credential.
+    It is derived rather than stored, so a changed credential names a different
+    account at once and nothing has to notice the change.
+    """
+
+    def __init__(self, *, pepper: str, workspace_id: uuid.UUID) -> None:
+        self._pepper = pepper.encode()
+        self._workspace_id = workspace_id
+
+    def name(self, provider: LLMProvider, instance: str, credential: ResolvedCredential) -> ProviderAccount:
+        """The account ``credential`` reaches.
+
+        The instance is left out of the digest, because renaming one does not
+        move its account.
+        """
+        canonical = json.dumps(
+            {"provider": provider.value, "api_base": credential.api_base, "api_key": credential.api_key},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return ProviderAccount(
+            provider=provider,
+            instance=instance,
+            workspace_id=self._workspace_id,
+            identity=hmac.new(self._pepper, canonical.encode(), hashlib.sha256).hexdigest(),
+        )
 
 
 @dataclass(frozen=True)
@@ -335,6 +425,14 @@ def resolve_provider_selector(
         # different model than the policy describes. The completion routes compile
         # it properly; everywhere else it surfaces as an unknown model.
         alias = resolve_static_policy_target(config, model_selector, user_id, workspace_id=workspace_id)
+    if alias is None:
+        # The catalog's own spellings: a catalog id for the model's cheapest
+        # offering, or ``instance:<catalog id>`` to pin the instance. Consulted last and only
+        # for a selector that names no offering already, so nothing a caller
+        # sends verbatim is ever rewritten; the workspace picks which
+        # organization's own offerings may answer. Relabeled like an alias: the
+        # caller sees the spelling they sent, and pricing keys on the target.
+        alias = resolve_catalog_selector(model_selector, workspace_id=workspace_id)
     selector = alias if alias is not None else model_selector
 
     split = split_selector(selector)
@@ -402,3 +500,21 @@ def normalize_pricing_key(config: GatewayConfig, raw_key: str) -> str:
     except (ValueError, AnyLLMError):
         return raw_key
     return f"{provider_key(provider)}:{model}"
+
+
+def is_deployment_instance_key(config: GatewayConfig, model_key: str) -> bool:
+    """Whether this pricing key names an instance the deployment holds the credential for.
+
+    The line between the two credential mechanisms, stated as a predicate. An
+    ``instance:model`` key whose prefix is in ``config.providers`` (config.yml
+    overlaid with the stored ``provider_credentials``) dispatches on the
+    deployment's own credential and never consults the organization-scoped tables;
+    a bare ``provider:model`` key resolves against an organization's BYO key
+    instead. :func:`resolve_provider_selector` above branches on exactly this
+    test, and `models.provider_keys` states the rule it comes from.
+
+    So it answers "who pays the upstream bill for this model", which is what
+    decides whether an organization may set its own rate for it.
+    """
+    split = split_selector(model_key)
+    return split is not None and split[0] in config.providers

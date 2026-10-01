@@ -4,10 +4,12 @@ import { BASE_CAPABILITIES } from "@/shared/hooks/useEntitlements"
 import { HOSTED_SURFACES } from "@/tests/fixtures"
 import { OVERLAY_NAV_LABEL_OVERRIDES } from "./overlayLabelOverrides"
 import { OVERLAY_NAV_ITEMS } from "./overlayNavItems"
+import { OVERLAY_DEPLOYMENT_NAV_SECTIONS } from "./overlaySections"
 import {
   applyNavLabelOverrides,
   composeNavItems,
   composeNavSections,
+  DEPLOYMENT_NAV_SECTIONS,
   isPathVisible,
   NAV_ITEMS,
   NAV_SECTIONS,
@@ -24,6 +26,16 @@ import type {
 } from "./types"
 
 describe("nav registry", () => {
+  it("gates the Playground route without placing it in a sidebar", () => {
+    expect(
+      NAV_SECTIONS.flatMap((section) => section.items).some(
+        (item) => item.to === "/playground",
+      ),
+    ).toBe(false)
+    expect(navItemForPath("/playground")?.surface).toBe("playground")
+    expect(isPathVisible("/playground", () => false)).toBe(false)
+  })
+
   it("exposes the base sections in display order", () => {
     expect(NAV_SECTIONS.map((section) => section.id)).toEqual([
       "index",
@@ -58,6 +70,7 @@ describe("nav registry", () => {
     // Both rails, because NAV_ITEMS is what answers "which entry is this
     // pathname" and a route is gated the same way whichever sidebar links it.
     expect(NAV_ITEMS.map((item) => item.label)).toEqual([
+      "Playground",
       "Overview",
       "Activity",
       "Usage",
@@ -65,15 +78,14 @@ describe("nav registry", () => {
       "Routing",
       "Tools",
       "API keys",
-      "Providers",
       "Members",
       "Usage",
       "Workspaces",
       "Members & roles",
       "Email domains",
-      "Providers",
       "Spend & budgets",
-      "Model pricing",
+      "Providers",
+      "Deployment providers",
       "Guardrails",
       "Org settings",
       "Settings",
@@ -101,11 +113,11 @@ describe("nav registry", () => {
     // /api/v1/organizations/me/keys. Removing a row from here is as
     // much a design decision as adding one.
     //
-    // Model pricing left it a third way (otari-ai#1943): the page behind it was
-    // never one answer. Its rate overrides are the organization's own and
-    // already management-gated, and its catalog read serves any session, so only
-    // two of its sections were ever the operator's and the page withholds those
-    // rather than the rail withholding the destination.
+    // Model pricing left it a third way, and then left the rail entirely. It was
+    // never one answer: its rate overrides were the organization's own and its
+    // catalog read served any session, so the page withheld its operator-only
+    // sections rather than the rail withholding the destination. Rates live on
+    // Providers instead, beside the models they price.
     //
     // Spend & budgets left it a fourth way, in the same issue: the route now
     // resolves to *two* pages, the deployment's for an operator and the
@@ -124,17 +136,85 @@ describe("nav registry", () => {
     expect(paths).toEqual([...new Set(paths)])
   })
 
+  it("puts the deployment destinations on their own rail", () => {
+    expect(
+      DEPLOYMENT_NAV_SECTIONS.flatMap((section) =>
+        section.items.map((item) => item.to),
+      ),
+    ).toEqual(["/settings", "/admin/accounts"])
+    // And on neither of the others. A destination drawn on two rails would
+    // resolve to whichever came first in NAV_ITEMS and be gated by that one.
+    const others = [...NAV_SECTIONS, ...ORG_NAV_SECTIONS].flatMap((section) =>
+      section.items.map((item) => item.to),
+    )
+    expect(others).not.toContain("/settings")
+    expect(others).not.toContain("/admin/accounts")
+  })
+
+  it("keeps a deployment destination registered, and therefore gated", () => {
+    // The failure this exists to catch: expressing "not on the rail" by
+    // deleting the entry. `NAV_ITEMS` is what `navItemForPath` answers from, so
+    // an unregistered path is an *ungated* one, and the shell would render
+    // these pages on a deployment that serves neither surface instead of
+    // refusing them. Nothing about the rail being empty says so, which is why
+    // it is asserted here rather than left to the rail tests.
+    for (const [to, surface, operatorOnly] of [
+      ["/settings", "settings", "refused"],
+      ["/admin/accounts", "admin", "unlisted"],
+    ] as const) {
+      const item = navItemForPath(to)
+      expect(item?.to).toBe(to)
+      expect(item?.surface).toBe(surface)
+      // The two values encode which refusal the server gives, 403 against 404.
+      // Flattening them would make the menu lie about one of the two.
+      expect(item?.operatorOnly).toBe(operatorOnly)
+      // And owned by the deployment rail, not the organization one it used to
+      // sit inside. Asserted as the rule rather than as the value: the first
+      // version of this line pinned "organization" on the strength of it being
+      // what the code returned, and that is how a page ended up opening a rail
+      // whose scope did not own it.
+      expect(navContextForPath(to)).toBe("deployment")
+    }
+  })
+
   it("sorts a pathname onto the rail that declares it", () => {
     // Not a URL-prefix rule: /workspaces and /settings are organization
     // destinations whose paths look like anything else, and /members is a
     // workspace one directly under the root.
     expect(navContextForPath("/members")).toBe("workspace")
     expect(navContextForPath("/workspaces")).toBe("organization")
-    expect(navContextForPath("/settings")).toBe("organization")
+    // Its own context, not the organization's: the deployment's pages describe
+    // the process every tenant shares. This line said "organization" while that
+    // was merely what the code did, and an asserted value is indistinguishable
+    // from a considered one.
+    expect(navContextForPath("/settings")).toBe("deployment")
     expect(navContextForPath("/organization/members")).toBe("organization")
     // Unregistered paths open in the context the shell starts in.
     expect(navContextForPath("/docs")).toBe("workspace")
   })
+
+  it.each([
+    ["standalone", "providers", "/providers"],
+    ["hosted", "organization_providers", "/organization/provider-keys"],
+  ])(
+    "places %s providers above Org settings in General",
+    (_, surface, path) => {
+      const visible = (item: NavItem) =>
+        item.surface === surface || item.surface === "organizations"
+      const general = visibleNavSections(ORG_NAV_SECTIONS, visible).find(
+        ({ section }) => section.id === "org-general",
+      )
+      expect(general?.items.map((item) => item.to)).toEqual([
+        path,
+        "/organization",
+      ])
+      expect(navContextForPath(path)).toBe("organization")
+      expect(navContextForPath(`${path}/detail`)).toBe("organization")
+      expect(
+        visibleNavSections(NAV_SECTIONS, visible).flatMap(({ items }) => items),
+      ).toEqual([])
+    },
+  )
 
   it("splits the tenancy pages across their two surfaces", () => {
     // The organization pages and the workspace pages are separate management
@@ -147,12 +227,13 @@ describe("nav registry", () => {
       ["Workspaces", "workspaces"],
       ["Members & roles", "organizations"],
       ["Email domains", "organizations"],
-      ["Providers", "organization_providers"],
     ])
+    // One row. An organization's rates are set on Providers, beside the models
+    // they price, and `/organization/pricing` is a redirect, which a rail row
+    // may not point at.
     const money = ORG_NAV_SECTIONS.find((section) => section.id === "org-money")
     expect(money?.items.map((item) => [item.label, item.surface])).toEqual([
       ["Spend & budgets", "budgets"],
-      ["Model pricing", "pricing"],
     ])
     // No row gates on `users` any more. The gateway still serves that surface
     // (budgets, keys and the roster all read /api/v1/users), but a person is a
@@ -245,27 +326,25 @@ describe("nav registry", () => {
   })
 
   it("gates every declared-but-unserved destination on a surface", () => {
-    // The organization rail draws three rows this gateway does not offer and
-    // still declares. Each is declared so the rail matches on a deployment that
-    // does serve them, and gated on a surface `STANDALONE_SURFACES` does not
-    // report so the row is absent here. Pinned as the whole set, because the
-    // failure mode is silent in both directions: a missing gate ships a link to
-    // a page that cannot work, and a gate on a surface the bootstrap *does*
-    // report hides a page that can. A typo in a surface name is silent the same
-    // way, since `NavItemBase.surface` is a bare string.
+    // The organization rail draws one row this gateway does not offer and still
+    // declares. It is declared so the rail matches on a deployment that does
+    // serve it, and gated on a surface `STANDALONE_SURFACES` does not report so
+    // the row is absent here. Pinned as the whole set, because the failure mode
+    // is silent in both directions: a missing gate ships a link to a page that
+    // cannot work, and a gate on a surface the bootstrap *does* report hides a
+    // page that can. A typo in a surface name is silent the same way, since
+    // `NavItemBase.surface` is a bare string.
     //
-    // Only the guardrail ceiling is an actual absence: no edition here serves
-    // that API. The other two are editorial, with the API mounted either way,
-    // and they differ in what the choice is about. Provider keys is about which
-    // credential table the deployment should be showing at all. Usage is about
-    // a question that only exists once tenants do (otari-ai#1963): standalone's
+    // Usage is editorial, with the API mounted either way, about a question
+    // that only exists once tenants do (otari-ai#1963): standalone's
     // organization is the deployment, so `/usage` already answers it whole.
-    // One mechanism, three reasons, so the set is worth reading as a list.
-    const unserved = new Map([
-      ["/organization/provider-keys", "organization_providers"],
-      ["/organization/guardrails", "organization_guardrails"],
-      ["/organization/usage", "organization_usage"],
-    ])
+    //
+    // Provider keys is not a second: `organization_providers` is published by
+    // both topologies, because the page behind it is where an organization's
+    // models are offered, priced and switched, which is a tenant's question on
+    // either. Its row therefore renders here beside the process-global one,
+    // which is why the two carry different labels.
+    const unserved = new Map([["/organization/usage", "organization_usage"]])
     for (const [to, surface] of unserved) {
       expect(navItemForPath(to)?.surface).toBe(surface)
     }
@@ -276,6 +355,8 @@ describe("nav registry", () => {
       "budgets",
       "keys",
       "models",
+      "organization_guardrails",
+      "organization_providers",
       "organizations",
       "pricing",
       "providers",
@@ -289,20 +370,28 @@ describe("nav registry", () => {
     for (const surface of unserved.values()) {
       expect(standalone).not.toContain(surface)
     }
-    // The three are not one category past that point, so the other direction is
-    // asserted per row. Two are served by a hosted deployment and withheld from
-    // standalone, which is what makes their rows appear there; the guardrail
-    // ceiling has no endpoint on *either* edition and is declared for a
-    // deployment that does serve it, so it is absent from both lists.
-    //
-    // Read from the fixture the hosted-shell tests render with, which is what
-    // keeps that fixture honest: a surface added to the backend's
-    // HOSTED_SURFACES and not to the fixture leaves those tests quietly
-    // rendering a rail the product does not have, and fails here instead.
+    // The row that moved, asserted from the other side: a standalone gateway
+    // reports this one, so its gate is what lets the row render rather than what
+    // hides it.
+    expect(standalone).toContain(
+      navItemForPath("/organization/provider-keys")?.surface,
+    )
+    // The other direction, read from the fixture the hosted-shell tests render
+    // with, which is what keeps that fixture honest: a surface added to the
+    // backend's HOSTED_SURFACES and not to the fixture leaves those tests
+    // quietly rendering a rail the product does not have, and fails here
+    // instead.
     for (const surface of ["organization_providers", "organization_usage"]) {
       expect(HOSTED_SURFACES).toContain(surface)
     }
-    expect(HOSTED_SURFACES).not.toContain("organization_guardrails")
+    // The guardrail row is the one that used to be here and is not: its API was
+    // dark on both editions until the surface was published, and it is keyed on
+    // the organization, so neither edition withholds it.
+    expect(standalone).toContain("organization_guardrails")
+    expect(HOSTED_SURFACES).toContain("organization_guardrails")
+    expect(navItemForPath("/organization/guardrails")?.surface).toBe(
+      "organization_guardrails",
+    )
   })
 
   it("declares no destination an overlay owns", () => {
@@ -357,16 +446,32 @@ describe("nav registry", () => {
       (section) => section.id === "org-general",
     )
     expect(general?.label).toBe("General")
-    expect(general?.items.map((item) => item.label)).toContain("Org settings")
+    expect(general?.items.map((item) => item.to)).toEqual([
+      "/organization/provider-keys",
+      "/providers",
+      "/organization/guardrails",
+      "/organization",
+    ])
+    // The labels are the thing under test, because both rows render on a
+    // standalone deployment and a shared label would leave them
+    // indistinguishable.
+    expect(general?.items.map((item) => item.label)).toEqual([
+      "Providers",
+      "Deployment providers",
+      "Guardrails",
+      "Org settings",
+    ])
   })
 
-  it("keeps section ids unique across the two rails", () => {
-    // What lets one override list and one contribution list address both
-    // rails: an id that appeared on each would rename two sections, or land one
+  it("keeps section ids unique across all three rails", () => {
+    // What lets one override list and one contribution list address every
+    // rail: an id that appeared on two would rename both sections, or land one
     // contribution's rows twice, from a single entry.
-    const ids = [...NAV_SECTIONS, ...ORG_NAV_SECTIONS].map(
-      (section) => section.id,
-    )
+    const ids = [
+      ...NAV_SECTIONS,
+      ...ORG_NAV_SECTIONS,
+      ...DEPLOYMENT_NAV_SECTIONS,
+    ].map((section) => section.id)
     expect(ids).toEqual([...new Set(ids)])
   })
 
@@ -374,6 +479,7 @@ describe("nav registry", () => {
     // The overlay tree lives in another repo; the seams here stay empty.
     expect(composeNavSections(NAV_SECTIONS, [])).toEqual(NAV_SECTIONS)
     expect(OVERLAY_NAV_ITEMS).toEqual([])
+    expect(OVERLAY_DEPLOYMENT_NAV_SECTIONS).toEqual([])
   })
 })
 
@@ -588,7 +694,7 @@ describe("composeNavItems", () => {
       label: "Cost & billing",
       items: [
         { to: "/budgets", label: "Spend & budgets", icon: FiBox },
-        { to: "/organization/pricing", label: "Model pricing", icon: FiBox },
+        { to: "/organization/usage", label: "Usage", icon: FiBox },
       ],
     },
     { id: "org-general", label: "General", items: [] },
@@ -613,7 +719,7 @@ describe("composeNavItems", () => {
     const composed = composeNavItems(base, [billing])
     expect(composed[0].items.map((item) => item.label)).toEqual([
       "Spend & budgets",
-      "Model pricing",
+      "Usage",
       "Billing",
     ])
     // The section keeps everything else it declared, heading included.
@@ -652,7 +758,7 @@ describe("composeNavItems", () => {
     ])
     expect(composed[0].items.map((item) => item.label)).toEqual([
       "Spend & budgets",
-      "Model pricing",
+      "Usage",
       "Billing",
       "Invoices",
     ])

@@ -37,8 +37,8 @@ from sqlalchemy.orm import Session
 from sqlmodel import col
 
 from gateway.core.config import API_ROOT
-from gateway.models.entities import DashboardSession, UsageLog
-from gateway.models.tenancy import Organization, OrganizationMember, User, Workspace, WorkspaceMember
+from gateway.models.tenancy import DashboardSession, Organization, OrganizationMember, User, Workspace, WorkspaceMember
+from gateway.models.usage import UsageLog
 from gateway.services.dashboard_session_service import SESSION_COOKIE_NAME, hash_session_token
 
 # Every read this router serves. Parametrized rather than asserted once, because
@@ -512,9 +512,7 @@ def test_the_context_agrees_with_the_admin_access_endpoint(client: TestClient, w
         assert context["deployment_operator"] is access["granted"], who
 
 
-def test_every_response_carrying_the_context_carries_the_operator_answer(
-    client: TestClient, world: _World
-) -> None:
+def test_every_response_carrying_the_context_carries_the_operator_answer(client: TestClient, world: _World) -> None:
     """`POST /me/switch` and `PATCH /me` return the shape too, not just `GET /me`.
 
     The dashboard keeps whichever context it saw last, so a write answering a

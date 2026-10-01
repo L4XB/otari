@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
+from gateway.auth.models import API_KEY_PREFIX
 from gateway.core.config import API_KEY_HEADER, API_ROOT, GatewayConfig
 
 from .conftest import MODEL_NAME
@@ -40,10 +41,12 @@ def test_create_api_key(client: TestClient, master_key_header: dict[str, str]) -
 
     assert "id" in data
     assert "key" in data
-    assert data["key"].startswith("gw-")
-    # The prefix is the leading slice of the plaintext, echoed for the show-once
-    # reveal so the list can later fingerprint the key without the full secret.
+    assert data["key"].startswith(API_KEY_PREFIX)
+    # The prefix and suffix are the leading and trailing slices of the plaintext,
+    # echoed for the show-once reveal so the list can later fingerprint the key
+    # without the full secret.
     assert data["key_prefix"] == data["key"][:10]
+    assert data["key_suffix"] == data["key"][-4:]
     assert data["key_name"] == "test-key"
     assert data["is_active"] is True
     assert "created_at" in data
@@ -127,8 +130,9 @@ def test_get_api_key(client: TestClient, master_key_header: dict[str, str], api_
 
     assert data["id"] == api_key_obj["id"]
     assert data["key_name"] == api_key_obj["key_name"]
-    # The fingerprint is listed; the full key never is.
+    # Both halves of the fingerprint are listed; the full key never is.
     assert "key_prefix" in data
+    assert "key_suffix" in data
     assert "key" not in data
 
 
@@ -272,9 +276,7 @@ def test_delete_nonexistent_api_key(client: TestClient, master_key_header: dict[
     assert response.status_code == 404
 
 
-def test_rotate_api_key_returns_new_working_key_same_id(
-    client: TestClient, master_key_header: dict[str, str]
-) -> None:
+def test_rotate_api_key_returns_new_working_key_same_id(client: TestClient, master_key_header: dict[str, str]) -> None:
     """Rotating a key returns a new secret for the same id, and the new key authenticates."""
     create_response = client.post(
         f"{API_ROOT}/keys",
@@ -292,11 +294,14 @@ def test_rotate_api_key_returns_new_working_key_same_id(
     rotated = rotate_response.json()
 
     assert rotated["id"] == original["id"]
-    assert rotated["key"].startswith("gw-")
+    assert rotated["key"].startswith(API_KEY_PREFIX)
     assert rotated["key"] != original["key"]
-    # Regenerate re-fingerprints: the prefix tracks the new secret, not the old one.
+    # Regenerate re-fingerprints both halves: they track the new secret, not the old
+    # one. A stale suffix here would be worse than an absent one, because the row
+    # would display four characters belonging to a key that no longer authenticates.
     assert rotated["key_prefix"] == rotated["key"][:10]
     assert rotated["key_prefix"] != original["key_prefix"]
+    assert rotated["key_suffix"] == rotated["key"][-4:]
     assert rotated["key_name"] == original["key_name"]
     assert rotated["user_id"] == original["user_id"]
     assert rotated["metadata"] == {"team": "eng"}
@@ -310,9 +315,7 @@ def test_rotate_api_key_returns_new_working_key_same_id(
     assert response.status_code == 200
 
 
-def test_rotate_api_key_old_secret_stops_working(
-    client: TestClient, master_key_header: dict[str, str]
-) -> None:
+def test_rotate_api_key_old_secret_stops_working(client: TestClient, master_key_header: dict[str, str]) -> None:
     """After rotation the previous secret no longer authenticates."""
     create_response = client.post(
         f"{API_ROOT}/keys",
@@ -343,9 +346,7 @@ def test_rotate_api_key_old_secret_stops_working(
     assert after.status_code == 401
 
 
-def test_rotate_api_key_resets_last_used_at(
-    client: TestClient, master_key_header: dict[str, str]
-) -> None:
+def test_rotate_api_key_resets_last_used_at(client: TestClient, master_key_header: dict[str, str]) -> None:
     """Rotation clears last_used_at since the new secret has never been used."""
     create_response = client.post(
         f"{API_ROOT}/keys",
@@ -372,9 +373,7 @@ def test_rotate_nonexistent_api_key(client: TestClient, master_key_header: dict[
     assert response.status_code == 404
 
 
-def test_rotate_api_key_without_master_key_fails(
-    client: TestClient, api_key_obj: dict[str, Any]
-) -> None:
+def test_rotate_api_key_without_master_key_fails(client: TestClient, api_key_obj: dict[str, Any]) -> None:
     """Rotation without master key authentication is rejected."""
     response = client.post(f"{API_ROOT}/keys/{api_key_obj['id']}/rotate")
 

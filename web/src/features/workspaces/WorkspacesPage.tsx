@@ -17,7 +17,9 @@ import { useDirtySnapshot } from "@/design-system/forms/useDirtySnapshot"
 import { PageIntro } from "@/design-system/layout/PageIntro"
 import { TableScrollFrame } from "@/design-system/layout/TableScrollFrame"
 import { FilterSelect } from "@/design-system/navigation/FilterSelect"
+import { budgetLabeler, shortBudgetId } from "@/features/budgets/budgetLabel"
 import { canManage, isDeploymentOperator } from "@/features/organization/roles"
+import { departureSummary } from "@/features/workspaces/providerKeyDepartures"
 import { WorkspaceProviderKeys } from "@/features/workspaces/WorkspaceProviderKeys"
 import { useBudgets } from "@/shared/api/budgets"
 import { ApiError } from "@/shared/api/client"
@@ -25,6 +27,7 @@ import { useOrganizationContext } from "@/shared/api/organizations"
 import { useProviders } from "@/shared/api/providers"
 import {
   useAllWorkspaceBudgetDefaults,
+  useAllWorkspaceProviderKeys,
   useCreateWorkspace,
   useCreateWorkspaceBudgetDefault,
   useDeleteWorkspace,
@@ -46,6 +49,18 @@ import { formatDate } from "@/shared/helpers/format"
 // string back to it.
 const getWorkspaceRowKey = (workspace: Workspace): string => workspace.id
 
+/**
+ * How many workspaces the provider-key column will fan out across.
+ *
+ * The summary costs one read per workspace, and the list above it is a
+ * `fetchAllPaged` walk whose own ceiling is 100 pages of 1000, so nothing else
+ * here bounds the fan-out. The column is a convenience, which is not worth tens
+ * of thousands of requests to a large tenant: past this many workspaces it is
+ * dropped rather than fetched, until an organization-scoped batch read exists
+ * to answer it in one.
+ */
+const PROVIDER_KEY_SUMMARY_LIMIT = 25
+
 const LAST_WORKSPACE_REASON =
   "An organization keeps at least one workspace; create another first"
 
@@ -61,14 +76,11 @@ const LAST_WORKSPACE_REASON =
 // with a message telling the operator to come and change it.
 const NO_DEFAULT = ""
 
-function budgetLabel(budget: Budget): string {
-  return budget.name ?? budget.budget_id.split("-")[0]
-}
-
 function budgetChoices(budgets: Budget[]): { value: string; label: string }[] {
+  const nameBudget = budgetLabeler(budgets)
   return budgets.map((budget) => ({
     value: budget.budget_id,
-    label: budgetLabel(budget),
+    label: nameBudget(budget),
   }))
 }
 
@@ -90,7 +102,7 @@ function DefaultBudgetPicker({
       // this could ever hold. `FieldMessages` reserves the line by default, and
       // `FilterSelect` reserved nothing, so the swap to `Select` brought ~23px
       // of empty back with it.
-      reserveMessage={false}
+      shouldReserveMessage={false}
       options={[
         { value: NO_DEFAULT, label: "No default" },
         ...budgetChoices(budgets),
@@ -129,14 +141,15 @@ function NarrowedDefaults({
 
   const taken = new Set(narrowed.map((row) => row.provider_key_id))
   const available = providers.filter((instance) => !taken.has(instance))
-  const pending =
+  const isPending =
     createDefault.isPending ||
     updateDefault.isPending ||
     deleteDefault.isPending
 
   return (
     <div className="flex flex-col gap-2">
-      <span className="text-body">Per-provider defaults</span>
+      {/* The section head role, as the provider-keys group below it uses. */}
+      <span className="text-title">Per-provider defaults</span>
       <ErrorBanner error={createDefault.error ?? updateDefault.error} />
       {narrowed.length === 0 ? (
         <span className="text-caption">
@@ -160,7 +173,7 @@ function NarrowedDefaults({
                   })
                 }
                 options={budgetChoices(budgets)}
-                disabled={pending}
+                disabled={isPending}
               />
               <Button
                 size="sm"
@@ -168,7 +181,7 @@ function NarrowedDefaults({
                 // Named per row, as the picker beside it is: this is a list of
                 // providers, not a table with a row header to lean on.
                 aria-label={`Remove default for ${row.provider_key_id}`}
-                isDisabled={pending}
+                isDisabled={isPending}
                 onPress={() => setPendingDelete(row)}
               >
                 Remove
@@ -203,7 +216,7 @@ function NarrowedDefaults({
           <Button
             size="sm"
             variant="ghost"
-            isDisabled={pending || provider === "" || budgetId === ""}
+            isDisabled={isPending || provider === "" || budgetId === ""}
             onPress={() =>
               createDefault.mutate(
                 {
@@ -319,8 +332,8 @@ export function CreateWorkspaceForm({
   // the deployment having no budgets. Resolved here rather than passed in
   // because the workspace switcher offers this same form.
   const context = useOrganizationContext()
-  const operates = isDeploymentOperator(context.data)
-  const budgets = useBudgets(operates)
+  const isOperator = isDeploymentOperator(context.data)
+  const budgets = useBudgets(isOperator)
   const [name, setName] = useState("")
   const [description, setDescription] = useState("")
   const [budgetId, setBudgetId] = useState(NO_DEFAULT)
@@ -358,7 +371,7 @@ export function CreateWorkspaceForm({
   // button said "and open" while nothing opened would be the worse bug of the
   // two this fixes.
   const entersWorkspace = onCreated !== undefined
-  const pending = create.isPending || createDefault.isPending || holding
+  const isPending = create.isPending || createDefault.isPending || holding
   // Only a refusal *about the name* belongs on the name. These three are the
   // ones this endpoint answers with when the input is the problem: taken (409),
   // malformed (400), or rejected by the schema (422). A 403, a 500 or a dropped
@@ -432,7 +445,7 @@ export function CreateWorkspaceForm({
       title="New workspace"
       submitLabel={entersWorkspace ? "Create and open" : "Create workspace"}
       onSubmit={submit}
-      isPending={pending}
+      isPending={isPending}
       isSubmitDisabled={trimmed === ""}
       isDirty={isDirty}
       returnFocusRef={returnFocusRef}
@@ -477,13 +490,13 @@ export function CreateWorkspaceForm({
         onChange={setDescription}
         // No description under it, so no line held open for one. See forms.md:
         // the reserve exists for an error to replace a description in.
-        reserveMessage={false}
+        shouldReserveMessage={false}
       />
       {/* Withheld from a caller who does not operate the deployment: the
           picker's options come from the operator-gated `/budgets` read, so
           offering it would be offering a control whose list is empty and whose
           save cannot succeed. */}
-      {operates ? (
+      {isOperator ? (
         <DefaultBudgetPicker
           budgets={budgets.data ?? []}
           value={budgetId}
@@ -511,9 +524,9 @@ function EditWorkspaceForm({
   // read itself is workspace-scoped and would answer, but this form only reads
   // it into those controls, so it is declined together with them.
   const context = useOrganizationContext()
-  const operates = isDeploymentOperator(context.data)
-  const budgets = useBudgets(operates)
-  const defaults = useWorkspaceBudgetDefaults(operates ? workspace.id : null)
+  const isOperator = isDeploymentOperator(context.data)
+  const budgets = useBudgets(isOperator)
+  const defaults = useWorkspaceBudgetDefaults(isOperator ? workspace.id : null)
   const createDefault = useCreateWorkspaceBudgetDefault()
   const updateDefault = useUpdateWorkspaceBudgetDefault()
   const deleteDefault = useDeleteWorkspaceBudgetDefault()
@@ -525,18 +538,18 @@ function EditWorkspaceForm({
   const narrowed = (defaults.data ?? []).filter(
     (row) => row.provider_key_id !== null,
   )
-  const providers = useProviders(operates)
+  const providers = useProviders(isOperator)
   const [name, setName] = useState(workspace.name)
   const [description, setDescription] = useState(workspace.description ?? "")
-  const [budgetId, setBudgetId] = useState<string | null>(null)
-  // Null until the operator touches the picker, so a default that arrives after
-  // the form mounted is still what the picker shows.
+  const [budgetId, setBudgetId] = useState<string>()
+  // Unset until the operator touches the picker, so a default that arrives
+  // after the form mounted is still what the picker shows.
   const selectedBudget = budgetId ?? aggregate?.budget_id ?? NO_DEFAULT
   const savingDefault =
     createDefault.isPending ||
     updateDefault.isPending ||
     deleteDefault.isPending
-  // `budgetId` rather than `selectedBudget`: null is "the picker was never
+  // `budgetId` rather than `selectedBudget`: unset is "the picker was never
   // touched", so a default that resolves after mount is part of the seed rather
   // than a change the guard should arm on. The per-provider defaults and the
   // provider keys below write as they are changed rather than on save, so
@@ -549,7 +562,7 @@ function EditWorkspaceForm({
     // With the picker withheld, an untouched `selectedBudget` over an unfetched
     // defaults list would read as "none" and delete nothing, but say so rather
     // than lean on that coincidence.
-    if (!operates) return
+    if (!isOperator) return
     if (selectedBudget === NO_DEFAULT) {
       if (aggregate) {
         await deleteDefault.mutateAsync({
@@ -621,19 +634,19 @@ function EditWorkspaceForm({
         onChange={setName}
         isRequired
         autoFocus
-        reserveMessage={false}
+        shouldReserveMessage={false}
       />
       <Field
         label="Description"
         value={description}
         onChange={setDescription}
-        reserveMessage={false}
+        shouldReserveMessage={false}
       />
       {/* Withheld from a caller who does not operate the deployment: the
           picker's options come from the operator-gated `/budgets` read, so
           offering it would be offering a control whose list is empty and whose
           save cannot succeed. */}
-      {operates ? (
+      {isOperator ? (
         <>
           <DefaultBudgetPicker
             budgets={budgets.data ?? []}
@@ -677,8 +690,8 @@ export function WorkspacesPage() {
   // unless the caller may read it, and the column it names is withheld with it
   // (the OrganizationMembersPage pattern, otari#838): without the names, every
   // cell could only echo a UUID fragment of the default's id.
-  const operates = isDeploymentOperator(context.data)
-  const budgets = useBudgets(operates)
+  const isOperator = isDeploymentOperator(context.data)
+  const budgets = useBudgets(isOperator)
   const remove = useDeleteWorkspace()
 
   const [creating, setCreating] = useState(false)
@@ -695,8 +708,8 @@ export function WorkspacesPage() {
     setCreatingCount((n) => n + 1)
     setCreating(true)
   }
-  const [editing, setEditing] = useState<string | null>(null)
-  const [deleting, setDeleting] = useState<Workspace | null>(null)
+  const [editing, setEditing] = useState<string>()
+  const [deleting, setDeleting] = useState<Workspace>()
 
   const rows = workspaces.data ?? []
   const workspaceIds = useMemo(() => rows.map((row) => row.id), [rows])
@@ -704,42 +717,63 @@ export function WorkspacesPage() {
   // workspace-scoped and would answer, but this page only reads it into the
   // withheld column below.
   const workspaceDefaults = useAllWorkspaceBudgetDefaults(
-    operates ? workspaceIds : [],
+    isOperator ? workspaceIds : [],
   )
   // The budget each workspace hands to its members, by workspace. Only the
   // aggregate default (no provider narrowing) is named: that is the one the
   // edit form sets, and a narrowed one is the budget's business, where it shows
   // under "Default for".
   const defaultBudgetName = useMemo(() => {
+    const known = budgets.data ?? []
+    const nameBudget = budgetLabeler(known)
     const names = new Map(
-      (budgets.data ?? []).map((budget) => [
-        budget.budget_id,
-        budget.name ?? budget.budget_id.split("-")[0],
-      ]),
+      known.map((budget) => [budget.budget_id, nameBudget(budget)]),
     )
-    const byWorkspace = new Map<string, string>()
-    for (const { workspaceId, default: row } of workspaceDefaults.data) {
-      if (row.provider_key_id === null) {
-        byWorkspace.set(
+    // A default naming a budget this page did not read has nothing to derive a
+    // label from, so the id is all there is left to show.
+    return new Map(
+      workspaceDefaults.data
+        .filter(({ default: row }) => row.provider_key_id === null)
+        .map(({ workspaceId, default: row }) => [
           workspaceId,
-          names.get(row.budget_id) ?? row.budget_id.split("-")[0],
-        )
-      }
-    }
-    return byWorkspace
+          names.get(row.budget_id) ?? shortBudgetId(row.budget_id),
+        ]),
+    )
   }, [budgets.data, workspaceDefaults.data])
   // Only once the list has actually answered: an empty list while loading is
   // not one workspace, and disabling on it would flicker.
   const isOnlyWorkspace = workspaces.isSuccess && rows.length === 1
   const manages = canManage(context.data)
-  const editingWorkspace = rows.find((row) => row.id === editing) ?? null
+  // Emptied for a caller who cannot manage the organization, and the column
+  // dropped with it below: this summarizes what the edit form holds, which is
+  // the one place a departure can be changed, so a caller who cannot open that
+  // form is neither offered the summary nor made to pay N reads for it. Its
+  // failure is not surfaced for the same reason the defaults' is not: a column
+  // that could not be read says nothing rather than turning the list into an
+  // error page.
+  const providerKeys = useAllWorkspaceProviderKeys(
+    manages && workspaceIds.length <= PROVIDER_KEY_SUMMARY_LIMIT
+      ? workspaceIds
+      : [],
+  )
+  // And dropped again where no workspace has a key to depart from, which is
+  // every standalone deployment: organization-owned provider keys are a hosted
+  // surface (`organization_providers`), so the column would otherwise be a
+  // header over blank cells on the single-tenant product. Read from the answer
+  // rather than from the surface, because the routes behind those keys are
+  // mounted on standalone too and an upgraded deployment can hold rows the
+  // dashboard never offered a page for.
+  const holdsProviderKeys = [...providerKeys.data.values()].some(
+    (rows) => rows.length > 0,
+  )
+  const editingWorkspace = rows.find((row) => row.id === editing)
   // Not gated on `creating`: unmounting the empty state when the dialog opens
   // takes away the node react-aria restores focus to, so closing drops focus to
   // `<body>`. `PageIntro`'s action is ungated for the same reason.
   const showOnboarding = !workspaces.isLoading && rows.length === 0
 
   // The default-budget column is dropped, not emptied, for a caller who cannot
-  // read the budget names it shows; see the note on `operates` above.
+  // read the budget names it shows; see the note on `isOperator` above.
   const columns = useMemo<DataTableColumn<Workspace>[]>(() => {
     const all: DataTableColumn<Workspace>[] = [
       {
@@ -788,6 +822,21 @@ export function WorkspacesPage() {
         },
       },
       {
+        id: "provider-keys",
+        header: "Provider keys",
+        cell: (workspace) => {
+          const summary = departureSummary(providerKeys.data.get(workspace.id))
+          if (summary === undefined) return null
+          // The muted rung for "nothing to see", the foreground one for a
+          // departure, which is the same pairing the default-budget cell makes.
+          return summary.hasDepartures ? (
+            <span className="text-sm text-foreground">{summary.text}</span>
+          ) : (
+            <span className="text-xs text-subtle">{summary.text}</span>
+          )
+        },
+      },
+      {
         id: "actions",
         header: "Actions",
         align: "end",
@@ -824,8 +873,19 @@ export function WorkspacesPage() {
         ),
       },
     ]
-    return all.filter((column) => operates || column.id !== "default-budget")
-  }, [manages, isOnlyWorkspace, defaultBudgetName, operates])
+    return all.filter((column) => {
+      if (column.id === "default-budget") return isOperator
+      if (column.id === "provider-keys") return manages && holdsProviderKeys
+      return true
+    })
+  }, [
+    manages,
+    isOnlyWorkspace,
+    defaultBudgetName,
+    isOperator,
+    providerKeys.data,
+    holdsProviderKeys,
+  ])
 
   return (
     <div className="flex flex-col">
@@ -837,7 +897,7 @@ export function WorkspacesPage() {
               ref={createButtonRef}
               variant="primary"
               onPress={() => {
-                setEditing(null)
+                setEditing(undefined)
                 openCreate()
               }}
             >
@@ -877,7 +937,7 @@ export function WorkspacesPage() {
         <EditWorkspaceForm
           key={editingWorkspace.id}
           workspace={editingWorkspace}
-          onClose={() => setEditing(null)}
+          onClose={() => setEditing(undefined)}
         />
       ) : null}
 
@@ -902,9 +962,9 @@ export function WorkspacesPage() {
       )}
 
       <ConfirmDialog
-        isOpen={deleting !== null}
+        isOpen={deleting !== undefined}
         onOpenChange={(open) => {
-          if (!open) setDeleting(null)
+          if (!open) setDeleting(undefined)
         }}
         heading="Delete workspace"
         body={
@@ -920,8 +980,8 @@ export function WorkspacesPage() {
           if (deleting) {
             remove.mutate(deleting.id, {
               onSuccess: () => {
-                if (editing === deleting.id) setEditing(null)
-                setDeleting(null)
+                if (editing === deleting.id) setEditing(undefined)
+                setDeleting(undefined)
               },
             })
           }

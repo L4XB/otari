@@ -85,7 +85,7 @@ export function ComboBoxField({
   isDisabled,
   isInvalid,
   errorMessage,
-  reserveMessage,
+  shouldReserveMessage,
   className = "",
   allowsCustomValue,
   autoFocus,
@@ -94,6 +94,7 @@ export function ComboBoxField({
   isSourceEmpty,
   emptyMessage,
   noMatchesMessage,
+  describedBy,
 }: {
   label: ReactNode
   /** The selected option's `value`, or, where custom values are allowed, text no option carries. */
@@ -116,7 +117,25 @@ export function ComboBoxField({
   isInvalid?: boolean
   /** Shown under the field and announced with it. Needs `isInvalid` to appear. */
   errorMessage?: string
-  reserveMessage?: boolean
+  shouldReserveMessage?: boolean
+  /**
+   * The id of text elsewhere on the page that describes this field.
+   *
+   * For a field in a control row whose message is a sentence: a sentence long
+   * enough to wrap makes that field taller than its siblings and pushes its
+   * input line out of the row (`web/design/forms.md`, "Control rows"), so the
+   * caller renders it under the row instead. The `description` slot is what
+   * wires a message to the input, and text outside the field never reaches it,
+   * so this carries the association across the gap.
+   *
+   * Pairs with an absent `description`, which is the case it exists for. It
+   * lands as the input's own `aria-describedby`, which **replaces** every id
+   * react-aria wired: the `description` slot and the `errorMessage` one both.
+   * Losing an error announcement is the worse half, so it is dropped while the
+   * field is invalid rather than left to silence the message in the state that
+   * needs it most.
+   */
+  describedBy?: string
   /** Layout and width at the call site. Not for restyling the field. */
   className?: string
   /** Offer the list as suggestions rather than as a whitelist, so anything typed stands. */
@@ -152,9 +171,9 @@ export function ComboBoxField({
   // moved from one this field reported. The first kind leaves whatever is in the
   // box stale: a list of these fields that drops a row moves a value under a
   // field that is still mounted.
-  const [seen, setSeen] = useState(value)
-  if (value !== seen) {
-    setSeen(value)
+  const [lastSeenValue, setLastSeenValue] = useState(value)
+  if (value !== lastSeenValue) {
+    setLastSeenValue(value)
     if (value !== typed) setTyped(undefined)
   }
 
@@ -209,6 +228,7 @@ export function ComboBoxField({
         <Input
           placeholder={placeholder}
           autoFocus={autoFocus}
+          aria-describedby={isInvalid ? undefined : describedBy}
           // A picker is never a credential field, so a password manager
           // offering to fill it is wrong at every call site rather than at some.
           autoComplete="off"
@@ -264,7 +284,7 @@ export function ComboBoxField({
           beside it in a row. The description goes through HeroUI's own slot,
           which is what wires it to the input via aria-describedby; a bare node
           there leaves the combo box reporting no description at all. */}
-      <FieldMessages reserve={reserveMessage}>
+      <FieldMessages shouldReserve={shouldReserveMessage}>
         {description ? (
           <Description className="text-muted">{description}</Description>
         ) : null}

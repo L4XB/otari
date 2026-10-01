@@ -20,7 +20,7 @@ from sqlalchemy.orm import sessionmaker
 from gateway.core.config import API_ROOT, GatewayConfig
 from gateway.log_config import logger as gateway_logger
 from gateway.main import create_app
-from gateway.models.entities import DashboardSession
+from gateway.models.tenancy import DashboardSession
 
 MASTER_KEY = "sk-test-master"
 PASSWORD = "a-real-password"  # pragma: allowlist secret
@@ -64,11 +64,14 @@ def _extract_token(text: str) -> str:
 
 def _claimed_and_verified(client: TestClient, caplog: pytest.LogCaptureFixture, *, email: str) -> None:
     """Get an identity onto the roster, signed up, and verified, ready to sign in."""
-    assert client.post(
-        f"{API_ROOT}/organizations/me/members",
-        json={"email": email, "role": "member"},
-        headers={"Otari-Key": MASTER_KEY},
-    ).status_code == 201
+    assert (
+        client.post(
+            f"{API_ROOT}/organizations/me/members",
+            json={"email": email, "role": "member"},
+            headers={"Otari-Key": MASTER_KEY},
+        ).status_code
+        == 201
+    )
 
     signup = _with_logs(
         client, caplog, lambda: client.post(f"{API_ROOT}/auth/signup", json={"email": email, "password": PASSWORD})
@@ -102,22 +105,29 @@ def test_reset_round_trips_end_to_end(tmp_path: Path, caplog: pytest.LogCaptureF
         )
         assert confirmed.status_code == 204, confirmed.text
 
-        assert client.post(
-            f"{API_ROOT}/auth/session", json={"email": "ada@example.com", "password": NEW_PASSWORD}
-        ).status_code == 200
-        assert client.post(
-            f"{API_ROOT}/auth/session", json={"email": "ada@example.com", "password": PASSWORD}
-        ).status_code == 401
+        assert (
+            client.post(
+                f"{API_ROOT}/auth/session", json={"email": "ada@example.com", "password": NEW_PASSWORD}
+            ).status_code
+            == 200
+        )
+        assert (
+            client.post(f"{API_ROOT}/auth/session", json={"email": "ada@example.com", "password": PASSWORD}).status_code
+            == 401
+        )
 
 
 def test_reset_works_before_the_address_is_verified(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     """Forgetting a password predates ever verifying it."""
     with _client(tmp_path) as client:
-        assert client.post(
-            f"{API_ROOT}/organizations/me/members",
-            json={"email": "ada@example.com", "role": "member"},
-            headers={"Otari-Key": MASTER_KEY},
-        ).status_code == 201
+        assert (
+            client.post(
+                f"{API_ROOT}/organizations/me/members",
+                json={"email": "ada@example.com", "role": "member"},
+                headers={"Otari-Key": MASTER_KEY},
+            ).status_code
+            == 201
+        )
         signup = _with_logs(
             client,
             caplog,
@@ -138,9 +148,10 @@ def test_reset_works_before_the_address_is_verified(tmp_path: Path, caplog: pyte
 def test_reset_revokes_the_identity_s_other_sessions(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     with _client(tmp_path) as client:
         _claimed_and_verified(client, caplog, email="ada@example.com")
-        assert client.post(
-            f"{API_ROOT}/auth/session", json={"email": "ada@example.com", "password": PASSWORD}
-        ).status_code == 200
+        assert (
+            client.post(f"{API_ROOT}/auth/session", json={"email": "ada@example.com", "password": PASSWORD}).status_code
+            == 200
+        )
 
         status_code, log_text = _request_reset(client, caplog, email="ada@example.com")
         assert status_code == 200
@@ -281,6 +292,40 @@ def test_request_reset_for_a_deactivated_identity_sends_nothing(
 
         assert status_code == 200
         assert "mail:console" not in log_text
+
+
+def test_request_reset_for_a_verified_identity_with_no_password_sends_nothing(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    with _client(tmp_path) as client:
+        assert (
+            client.post(
+                f"{API_ROOT}/organizations/me/members",
+                json={"email": "ada@example.com", "role": "member"},
+                headers={"Otari-Key": MASTER_KEY},
+            ).status_code
+            == 201
+        )
+        engine = create_engine(f"sqlite:///{tmp_path / 'reset-test.db'}")
+        with engine.begin() as connection:
+            connection.execute(
+                text('UPDATE "user" SET email_verified_at = CURRENT_TIMESTAMP WHERE email = :email'),
+                {"email": "ada@example.com"},
+            )
+        engine.dispose()
+
+        status_code, log_text = _request_reset(client, caplog, email="ada@example.com")
+
+        assert status_code == 200
+        assert "mail:console" not in log_text
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'reset-test.db'}")
+    with engine.begin() as connection:
+        token_hash = connection.execute(
+            text('SELECT password_reset_token_hash FROM "user" WHERE email = :email'), {"email": "ada@example.com"}
+        ).scalar_one()
+    engine.dispose()
+    assert token_hash is None
 
 
 def test_request_reset_without_mail_configured_is_refused(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
