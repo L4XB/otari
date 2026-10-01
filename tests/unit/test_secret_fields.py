@@ -19,6 +19,9 @@ over the credential it was never shown.
 import uuid
 from datetime import UTC, datetime
 
+import pytest
+
+from gateway.exceptions.shared_exceptions import UnresolvedRedactionError
 from gateway.models.guardrails import OrganizationGuardrail
 from gateway.models.providers import ProviderCredential
 from gateway.models.secret_fields import (
@@ -126,11 +129,12 @@ class TestNestedRoundTrip:
     def test_entries_that_mask_to_the_same_thing_are_not_guessed_between(self) -> None:
         # Both stored entries mask to {"token": "***"}, so the one that was kept
         # cannot be told from the one that was dropped. Guessing would put a
-        # credential under a different header; the mask is kept literally.
+        # credential under a different header.
         stored = {"extra_headers": [{"token": "live-a"}, {"token": "live-b"}]}
         submitted = {"extra_headers": [{"token": REDACTED_VALUE}]}
 
-        assert restore_redacted_values(submitted, stored) == {"extra_headers": [{"token": REDACTED_VALUE}]}
+        with pytest.raises(UnresolvedRedactionError):
+            restore_redacted_values(submitted, stored)
 
 
 class TestListElementIdentity:
@@ -138,13 +142,30 @@ class TestListElementIdentity:
 
     The editor echoes each entry masked; an entry the caller did not edit is
     therefore identical to its stored entry's masked form, wherever it moved.
+    An edited entry that still carries the mask is refused rather than guessed.
     """
 
     STORED = {"extra_headers": [{"name": "x", "token": "live-a"}, {"name": "y", "token": "live-b"}]}
 
+    @pytest.mark.parametrize(
+        "stored",
+        [
+            {"extra": [{"token": "A"}, {"token": "B"}]},
+            {"extra": [{"name": "x", "token": "A"}, {"name": "x", "token": "B"}]},
+            {"extra": [[{"api_key": "A"}], [{"api_key": "B"}]]},
+        ],
+        ids=["secret-only", "same-visible-fields", "nested-lists"],
+    )
+    def test_an_unchanged_list_round_trips_however_alike_its_entries_look(self, stored: dict[str, object]) -> None:
+        # The review on #1129: these entries mask to the same thing, and an
+        # unchanged load-and-save wrote *** over every credential in the list.
+        echoed = redact_secret_like_values(stored)
+
+        assert restore_redacted_values(echoed, stored) == stored
+
     def test_reordering_entries_keeps_each_entry_its_own_credential(self) -> None:
-        # The report on #1129: pairing by index handed each entry the token of
-        # whatever used to sit at its position.
+        # Pairing by index handed each entry the token of whatever used to sit
+        # at its position.
         submitted = {"extra_headers": [{"name": "y", "token": REDACTED_VALUE}, {"name": "x", "token": REDACTED_VALUE}]}
 
         assert restore_redacted_values(submitted, self.STORED) == {
@@ -173,120 +194,34 @@ class TestListElementIdentity:
 
         assert restore_redacted_values(submitted, self.STORED) == {"extra_headers": [{"name": "y", "token": "live-b"}]}
 
-    def test_editing_one_entry_in_place_keeps_its_credential(self) -> None:
-        # The dashboard flow the restore exists for: change one visible field of
-        # one entry and save the whole object back.
-        submitted = {"extra_headers": [{"name": "x", "token": REDACTED_VALUE}, {"name": "y2", "token": REDACTED_VALUE}]}
+    def test_an_edited_entry_with_its_credential_re_entered_is_taken_as_sent(self) -> None:
+        submitted = {"extra_headers": [{"name": "x", "token": REDACTED_VALUE}, {"name": "y2", "token": "live-b2"}]}
 
         assert restore_redacted_values(submitted, self.STORED) == {
-            "extra_headers": [{"name": "x", "token": "live-a"}, {"name": "y2", "token": "live-b"}]
+            "extra_headers": [{"name": "x", "token": "live-a"}, {"name": "y2", "token": "live-b2"}]
         }
 
-    def test_an_edited_entry_that_also_moved_is_not_paired_by_position(self) -> None:
-        # "x" moved to index 1, so index 0 no longer means the entry stored
-        # there. The edited entry cannot be identified and keeps the mask
-        # rather than taking x's token.
-        submitted = {"extra_headers": [{"name": "y2", "token": REDACTED_VALUE}, {"name": "x", "token": REDACTED_VALUE}]}
-
-        assert restore_redacted_values(submitted, self.STORED) == {
-            "extra_headers": [{"name": "y2", "token": REDACTED_VALUE}, {"name": "x", "token": "live-a"}]
-        }
-
-    def test_two_edited_entries_are_not_paired_by_position(self) -> None:
-        # Every visible field was edited, so nothing the entries still share
-        # shows whether they also moved, and neither is guessed at.
-        submitted = {
-            "extra_headers": [{"name": "y2", "token": REDACTED_VALUE}, {"name": "x2", "token": REDACTED_VALUE}]
-        }
-
-        assert restore_redacted_values(submitted, self.STORED) == submitted
-
-    LABELED = {
-        "extra_headers": [
-            {"name": "a", "token": "secretA", "label": "old-a"},
-            {"name": "b", "token": "secretB", "label": "old-b"},
-        ]
-    }
-
-    def test_editing_two_entries_in_place_keeps_both_credentials(self) -> None:
-        # The review on #1129: relabeling both entries lost both tokens, where
-        # pairing by index had kept them. The names they kept identify them.
-        submitted = {
-            "extra_headers": [
-                {"name": "a", "token": REDACTED_VALUE, "label": "new-a"},
-                {"name": "b", "token": REDACTED_VALUE, "label": "new-b"},
-            ]
-        }
-
-        assert restore_redacted_values(submitted, self.LABELED) == {
-            "extra_headers": [
-                {"name": "a", "token": "secretA", "label": "new-a"},
-                {"name": "b", "token": "secretB", "label": "new-b"},
-            ]
-        }
-
-    def test_two_edited_entries_that_also_moved_keep_their_own_credentials(self) -> None:
-        # Pairing the edited entries by index would cross the tokens here, as it
-        # did for the unedited swap this PR started from.
-        submitted = {
-            "extra_headers": [
-                {"name": "b", "token": REDACTED_VALUE, "label": "new-b"},
-                {"name": "a", "token": REDACTED_VALUE, "label": "new-a"},
-            ]
-        }
-
-        assert restore_redacted_values(submitted, self.LABELED) == {
-            "extra_headers": [
-                {"name": "b", "token": "secretB", "label": "new-b"},
-                {"name": "a", "token": "secretA", "label": "new-a"},
-            ]
-        }
-
-    def test_a_field_every_entry_shares_does_not_tell_edited_entries_apart(self) -> None:
-        stored = {
-            "extra_headers": [
-                {"scheme": "bearer", "name": "x", "token": "live-a"},
-                {"scheme": "bearer", "name": "y", "token": "live-b"},
-            ]
-        }
-        submitted = {
-            "extra_headers": [
-                {"scheme": "bearer", "name": "x2", "token": REDACTED_VALUE},
-                {"scheme": "bearer", "name": "y2", "token": REDACTED_VALUE},
-            ]
-        }
-
-        assert restore_redacted_values(submitted, stored) == submitted
-
-    def test_one_stored_credential_is_never_handed_to_two_entries(self) -> None:
-        # Both edited entries are closest to the first stored entry. Only the
-        # closer one takes its token; the other is not the second stored entry
-        # either, so it keeps the mask.
-        stored = {
-            "extra_headers": [
-                {"a": 1, "b": 1, "c": 1, "d": 1, "token": "live-a"},
-                {"a": 2, "b": 2, "c": 2, "d": 2, "token": "live-b"},
-            ]
-        }
-        submitted = {
-            "extra_headers": [
-                {"a": 1, "b": 1, "c": 7, "d": 7, "token": REDACTED_VALUE},
-                {"a": 1, "b": 1, "c": 1, "d": 9, "token": REDACTED_VALUE},
-            ]
-        }
-
-        assert restore_redacted_values(submitted, stored) == {
-            "extra_headers": [
-                {"a": 1, "b": 1, "c": 7, "d": 7, "token": REDACTED_VALUE},
-                {"a": 1, "b": 1, "c": 1, "d": 9, "token": "live-a"},
-            ]
-        }
+    @pytest.mark.parametrize(
+        "submitted",
+        [
+            [{"name": "x", "token": REDACTED_VALUE}, {"name": "y2", "token": REDACTED_VALUE}],
+            [{"name": "y2", "token": REDACTED_VALUE}, {"name": "x", "token": REDACTED_VALUE}],
+            [{"name": "x2", "token": REDACTED_VALUE}, {"name": "y2", "token": REDACTED_VALUE}],
+        ],
+        ids=["in-place", "edited-and-moved", "both-edited"],
+    )
+    def test_an_edited_entry_still_carrying_the_mask_is_refused(self, submitted: list[object]) -> None:
+        # Which stored token the edited entry had cannot be told without a guess,
+        # and a wrong guess hands it another entry's credential.
+        with pytest.raises(UnresolvedRedactionError):
+            restore_redacted_values({"extra_headers": submitted}, self.STORED)
 
     def test_duplicate_entries_with_different_credentials_are_not_guessed_between(self) -> None:
         stored = {"extra_headers": [{"name": "x", "token": "live-a"}, {"name": "x", "token": "live-b"}]}
-        submitted = {"extra_headers": [{"name": "x", "token": REDACTED_VALUE}, {"name": "x", "token": REDACTED_VALUE}]}
+        submitted = {"extra_headers": [{"name": "x", "token": REDACTED_VALUE}]}
 
-        assert restore_redacted_values(submitted, stored) == submitted
+        with pytest.raises(UnresolvedRedactionError):
+            restore_redacted_values(submitted, stored)
 
     def test_a_real_nested_value_still_replaces_the_stored_one(self) -> None:
         # The control for the whole pairing: restoring must not mean "the caller

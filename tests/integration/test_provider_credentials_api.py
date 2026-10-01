@@ -573,6 +573,48 @@ def test_saving_the_masked_client_args_back_keeps_the_stored_credential(
     assert stored.client_args == {"region_name": "eu-west-1", "aws_secret_access_key": "wJalrXUtnFEMIsecret"}
 
 
+def test_a_nested_credential_is_masked_and_survives_an_unchanged_save(
+    client: TestClient,
+    master_key_header: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    db_session: Session,
+) -> None:
+    """otari#1125 through the route: masked on read at any depth, kept on save.
+
+    The list entries differ only in their secret, so they mask to the same
+    thing; an unchanged save must still keep both. An edited entry that still
+    carries the mask is refused rather than paired with a stored token by guess.
+    """
+    _with_key(monkeypatch)
+    client_args = {
+        "default_headers": {"Authorization": "Bearer nested-secret"},
+        "extra": [{"token": "list-secret-a"}, {"token": "list-secret-b"}],
+    }
+    created = client.post(
+        f"{API_ROOT}/provider-credentials",
+        json={"instance": "bedrock", "provider_type": "bedrock", "client_args": client_args},
+        headers=master_key_header,
+    )
+    assert created.status_code == 201, created.text
+
+    listed = client.get(f"{API_ROOT}/provider-credentials", headers=master_key_header)
+    assert "secret" not in listed.text
+    shown = next(entry for entry in listed.json() if entry["instance"] == "bedrock")["client_args"]
+
+    saved = client.patch(
+        f"{API_ROOT}/provider-credentials/bedrock", json={"client_args": shown}, headers=master_key_header
+    )
+    assert saved.status_code == 200, saved.text
+    assert _stored_client_args(db_session) == client_args
+
+    edited = {**shown, "extra": [{**shown["extra"][0], "name": "x"}, shown["extra"][1]]}
+    refused = client.patch(
+        f"{API_ROOT}/provider-credentials/bedrock", json={"client_args": edited}, headers=master_key_header
+    )
+    assert refused.status_code == 400, refused.text
+    assert _stored_client_args(db_session) == client_args
+
+
 def _stored_client_args(db_session: Session) -> dict[str, object]:
     """Read the row back from the database, past whatever the API chose to show."""
     db_session.expire_all()
